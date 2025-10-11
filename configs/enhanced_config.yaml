@@ -1,0 +1,132 @@
+# 增强版配置文件 - 支持四个模型并包含丰富的可视化和可解释性分析
+
+# 数据配置
+data:
+  spectra_csv: data/spectra.csv      # 光谱数据路径
+  clinical_csv: data/clinical.csv    # 临床数据路径
+  label_col: Group                   # 标签列名
+  max_scans: 180                     # 每个病人最多扫描点数
+  
+  # 数据划分比例
+  train_ratio: 0.7                   # 训练集比例
+  val_ratio: 0.15                    # 验证集比例
+  test_ratio: 0.15                   # 测试集比例
+
+# 模型配置
+model:
+  name: AttentionMultimodal          # 默认模型名称
+  num_classes: 2                     # 分类类别数
+  
+  # 通用模型参数
+  spec_emb: 256                      # 光谱embedding维度
+  tab_emb: 128                       # 表格embedding维度
+  
+  # 注意力模型参数
+  fusion: cross                      # 融合方式: cross, self, hybrid
+  
+  # MMTM模型参数
+  mmtm_bottleneck: 128               # MMTM瓶颈维度
+  
+  # 增强版MMTM参数
+  num_attention_heads: 8             # 注意力头数
+  fusion_strategy: hierarchical      # 融合策略: hierarchical, concat, interaction
+  enable_uncertainty: true           # 是否启用不确定性估计
+
+# 训练配置
+train:
+  batch_size: 8                      # 批次大小
+  lr: 0.001                          # 学习率
+  epochs: 50                         # 训练轮数
+  weight_decay: 1e-4                 # 权重衰减
+  early_stopping_patience: 10        # 早停耐心值
+  
+  # 保存配置
+  save_dir: results                  # 结果保存目录
+  save_prefix: model                 # 模型保存前缀
+
+# 要训练的模型列表 (用于 --train-all 模式)
+models_to_train:
+  - AttentionMultimodal              # 注意力机制模型
+  - ConcatFusion                     # 基线融合模型
+  - MMTMMultimodal                   # 多模态张量融合模型
+  - TFTMultimodal                    # 时序融合Transformer模型
+  # - EnhancedMMTM                   # 增强版MMTM模型 (可选)
+
+# 可视化配置
+visualization:
+  enable: true                       # 是否启用可视化
+  save_plots: true                   # 是否保存图表
+  plot_format: png                   # 图表格式
+  dpi: 300                           # 图表分辨率
+  
+  # 训练过程可视化
+  plot_training_curves: true         # 训练曲线
+  plot_validation_curves: true       # 验证曲线
+  
+  # 评估可视化
+  plot_roc_curves: true              # ROC曲线
+  plot_confusion_matrix: true        # 混淆矩阵
+  plot_precision_recall: true        # 精确率-召回率曲线
+  plot_prediction_distribution: true # 预测概率分布
+  plot_feature_visualization: true   # 特征可视化
+
+# 可解释性分析配置
+interpretability:
+  enable: true                       # 是否启用可解释性分析
+  
+  # SHAP分析
+  shap_analysis: true                # SHAP特征重要性分析
+  shap_background_samples: 10        # SHAP背景样本数
+  shap_explanation_samples: 5        # SHAP解释样本数
+  
+  # 注意力分析
+  attention_analysis: true           # 注意力权重分析
+  attention_visualization: true      # 注意力可视化
+  
+  # 特征重要性分析
+  feature_importance: true           # 特征重要性分析
+  pca_analysis: true                 # PCA分析
+  tsne_analysis: true                # t-SNE分析
+  
+  # GradCAM分析 (如果支持)
+  gradcam_analysis: false            # GradCAM分析
+
+# 模型比较配置
+comparison:
+  enable: true                       # 是否启用模型比较
+  compare_metrics:                   # 比较的指标
+    - acc                            # 准确率
+    - auc                            # AUC
+    - f1                             # F1分数
+    - sensitivity@90%spec            # 敏感性@90%特异性
+  
+  # 比较可视化
+  plot_comparison_charts: true       # 比较图表
+  plot_roc_comparison: true          # ROC曲线比较
+  save_comparison_table: true        # 保存比较表格
+
+# 日志配置
+logging:
+  level: INFO                        # 日志级别
+  save_logs: true                    # 是否保存日志
+  log_file: training.log             # 日志文件名
+
+# 设备配置
+device:
+  use_cuda: true                     # 是否使用CUDA
+  cuda_device: 0                     # CUDA设备ID
+  mixed_precision: false             # 是否使用混合精度训练
+
+# 随机种子
+random_seed: 42                      # 随机种子
+
+# 实验配置
+experiment:
+  name: multimodal_experiment        # 实验名称
+  description: "多模态糖尿病预测实验"  # 实验描述
+  tags:                              # 实验标签
+    - multimodal
+    - diabetes
+    - attention
+    - fusion
+
