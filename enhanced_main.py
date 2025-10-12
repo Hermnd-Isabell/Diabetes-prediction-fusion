@@ -5,7 +5,6 @@
 支持的模型:
 - AttentionMultimodal (注意力机制)
 - Baseline (ConcatFusion, EnsembleFusion)  
-- MMTMMultimodal (多模态张量融合)
 - TFTMultimodal (时序融合Transformer)
 
 功能特性:
@@ -33,7 +32,6 @@ from trainers.enhanced_trainer import EnhancedTrainer, compare_models
 from models.Baseline import SpectraEncoder, TabularEncoder, ConcatFusion, EnsembleFusion
 from models.attention_models import AttentionMultimodal
 from models.tft_models import TFTMultimodal
-from models.mmtm_models import MMTMMultimodal
 from models.enhanced_mmtm_models import EnhancedMMTMFusion
 
 # 忽略警告
@@ -94,15 +92,6 @@ def build_model(cfg: dict, tab_dim: int, spec_len: int) -> torch.nn.Module:
             num_classes=num_classes
         )
     
-    elif model_name == "MMTMMultimodal":
-        return MMTMMultimodal(
-            tab_dim=tab_dim,
-            spec_len=spec_len,
-            spec_emb=cfg["model"].get("spec_emb", 256),
-            tab_emb=cfg["model"].get("tab_emb", 128),
-            num_classes=num_classes,
-            mmtm_bottleneck=cfg["model"].get("mmtm_bottleneck", 128)
-        )
     
     elif model_name == "EnhancedMMTM":
         return EnhancedMMTMFusion(
@@ -314,7 +303,6 @@ def train_all_models(
     models_to_train = cfg.get("models_to_train", [
         "AttentionMultimodal",
         "ConcatFusion", 
-        "MMTMMultimodal",
         "TFTMultimodal"
     ])
     

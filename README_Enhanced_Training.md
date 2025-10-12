@@ -14,12 +14,8 @@
 - 全连接层分类
 - 轻量级架构
 
-### 3. **MMTMMultimodal** - 多模态张量融合
-- 张量融合机制
-- 模态间交互建模
-- 高效的特征融合
 
-### 4. **TFTMultimodal** - 时序融合Transformer
+### 3. **TFTMultimodal** - 时序融合Transformer
 - Transformer架构
 - 时序建模能力
 - 长距离依赖捕获
@@ -144,7 +140,6 @@ results/
 │   ├── attention_analysis.png     # 注意力分析
 │   └── results.json               # 详细结果
 ├── ConcatFusion/
-├── MMTMMultimodal/
 ├── TFTMultimodal/
 └── comparison/
     ├── model_comparison.png       # 模型比较图表
@@ -198,7 +193,6 @@ model:
 models_to_train:
   - AttentionMultimodal
   - ConcatFusion
-  - MMTMMultimodal
   - TFTMultimodal
 ```
 

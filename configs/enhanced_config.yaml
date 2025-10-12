@@ -48,7 +48,6 @@ train:
 models_to_train:
   - AttentionMultimodal              # 注意力机制模型
   - ConcatFusion                     # 基线融合模型
-  - MMTMMultimodal                   # 多模态张量融合模型
   - TFTMultimodal                    # 时序融合Transformer模型
   # - EnhancedMMTM                   # 增强版MMTM模型 (可选)
 

@@ -45,13 +45,12 @@ def main():
     print("📋 可用的实验选项:")
     print("1. 训练单个模型 (AttentionMultimodal)")
     print("2. 训练单个模型 (ConcatFusion)")
-    print("3. 训练单个模型 (MMTMMultimodal)")
-    print("4. 训练单个模型 (TFTMultimodal)")
-    print("5. 训练所有模型并比较")
-    print("6. 仅评估已训练的模型")
-    print("7. 自定义实验")
+    print("3. 训练单个模型 (TFTMultimodal)")
+    print("4. 训练所有模型并比较")
+    print("5. 仅评估已训练的模型")
+    print("6. 自定义实验")
     
-    choice = input("\n请选择实验选项 (1-7): ").strip()
+    choice = input("\n请选择实验选项 (1-6): ").strip()
     
     if choice == "1":
         cmd = f"python enhanced_main.py --config {config_file} --model AttentionMultimodal"
@@ -62,29 +61,24 @@ def main():
         run_command(cmd, "训练基线融合模型")
         
     elif choice == "3":
-        cmd = f"python enhanced_main.py --config {config_file} --model MMTMMultimodal"
-        run_command(cmd, "训练MMTM多模态融合模型")
-        
-    elif choice == "4":
         cmd = f"python enhanced_main.py --config {config_file} --model TFTMultimodal"
         run_command(cmd, "训练TFT时序融合模型")
         
-    elif choice == "5":
+    elif choice == "4":
         cmd = f"python enhanced_main.py --config {config_file} --train-all"
         run_command(cmd, "训练所有模型并比较")
         
-    elif choice == "6":
+    elif choice == "5":
         model_name = input("请输入要评估的模型名称: ").strip()
         cmd = f"python enhanced_main.py --config {config_file} --eval-only {model_name}"
         run_command(cmd, f"评估模型 {model_name}")
         
-    elif choice == "7":
+    elif choice == "6":
         print("\n📝 自定义实验选项:")
         print("可用的模型:")
         print("  - AttentionMultimodal")
         print("  - ConcatFusion")
         print("  - EnsembleFusion")
-        print("  - MMTMMultimodal")
         print("  - TFTMultimodal")
         print("  - EnhancedMMTM")
         

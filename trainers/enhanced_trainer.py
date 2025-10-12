@@ -5,7 +5,6 @@
 支持的模型:
 - AttentionMultimodal (注意力机制)
 - Baseline (ConcatFusion, EnsembleFusion)
-- MMTMMultimodal (多模态张量融合)
 - TFTMultimodal (时序融合Transformer)
 
 功能特性:
