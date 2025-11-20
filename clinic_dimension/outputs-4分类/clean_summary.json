@@ -1,0 +1,11 @@
+{
+  "n_rows": 142,
+  "n_cols": 52,
+  "label": "标签分类",
+  "allowed_labels": [
+    0,
+    1,
+    2,
+    3
+  ]
+}

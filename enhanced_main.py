@@ -74,13 +74,21 @@ def build_model(cfg: dict, tab_dim: int, spec_len: int) -> torch.nn.Module:
         return EnsembleFusion(spec_dim=256, clin_dim=128)
     
     elif model_name == "AttentionMultimodal":
+        # 兼容旧配置中的 fusion 取值
+        fusion_cfg = cfg["model"].get("fusion", "enhanced_cross")
+        fusion_map = {
+            "cross": "enhanced_cross",
+            "enhanced_cross": "enhanced_cross",
+            "concat": "concat"
+        }
+        fusion_type = fusion_map.get(fusion_cfg, fusion_cfg)
+
         return AttentionMultimodal(
-            tab_dim=tab_dim,
-            spec_len=spec_len,
-            spec_emb=cfg["model"].get("spec_emb", 256),
-            tab_emb=cfg["model"].get("tab_emb", 128),
+            spec_embedding_dim=cfg["model"].get("spec_emb", 256),
+            tab_embedding_dim=cfg["model"].get("tab_emb", 128),
             num_classes=num_classes,
-            fusion=cfg["model"].get("fusion", "cross")
+            fusion_type=fusion_type,
+            tab_dim=tab_dim
         )
     
     elif model_name == "TFTMultimodal":
@@ -221,13 +229,17 @@ def train_single_model(
     # 构建模型
     model = build_model(cfg, dataset_info['tab_dim'], dataset_info['spec_len'])
     
-    # 创建训练器
+    # 创建训练器（确保超参数为数值类型）
+    lr_value = float(cfg["train"].get("lr", 1e-3))
+    wd_raw = cfg["train"].get("weight_decay", 1e-4)
+    weight_decay_value = float(wd_raw) if wd_raw is not None else 0.0
+
     trainer = EnhancedTrainer(
         model=model,
         model_name=cfg["model"]["name"],
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        lr=cfg["train"]["lr"],
-        weight_decay=cfg["train"].get("weight_decay", 1e-4),
+        lr=lr_value,
+        weight_decay=weight_decay_value,
         save_dir=cfg["train"].get("save_dir", "results"),
         enable_visualization=cfg.get("visualization", {}).get("enable", True),
         enable_interpretability=cfg.get("interpretability", {}).get("enable", True)

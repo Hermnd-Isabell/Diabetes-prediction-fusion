@@ -59,6 +59,33 @@ class TabularEncoder(nn.Module):
 class ConcatFusion(nn.Module):
     def __init__(self, spec_dim=256, clin_dim=128, num_classes=2):
         super().__init__()
+        self.spec_dim = spec_dim
+        self.clin_dim = clin_dim
+        self.num_classes = num_classes
+        
+        # 内部编码器，用于处理原始输入
+        self.internal_spec_encoder = nn.Sequential(
+            nn.Conv1d(1, 64, kernel_size=7, padding=3),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(256, spec_dim),
+            nn.LayerNorm(spec_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        
+        # 表格编码器将在第一次前向传播时动态构建
+        self.internal_tab_encoder = None
+        self.tab_input_dim = None
+        
         self.classifier = nn.Sequential(
             nn.Linear(spec_dim + clin_dim, 256),
             nn.ReLU(),
@@ -66,9 +93,39 @@ class ConcatFusion(nn.Module):
         )
 
     def forward(self, spectra, mask=None, tabular=None):
-        # 假设输入已经是 embedding
-        fused = torch.cat([spectra, tabular], dim=-1)   # [B, 384]
-        logits = self.classifier(fused)                 # [B, C]
+        # 检查输入格式
+        if isinstance(spectra, dict) and isinstance(tabular, dict):
+            # 字典格式输入（来自外部模型）
+            spec_embedding = spectra["embedding"]
+            tab_embedding = tabular["embedding"]
+        else:
+            # 原始张量输入（来自假数据）
+            # 处理光谱数据：[B, num_scans, wavelengths] -> [B, wavelengths]
+            if spectra.dim() == 3:
+                spectra = spectra.mean(dim=1)  # 平均多个扫描
+            spectra = spectra.unsqueeze(1)  # [B, 1, wavelengths]
+            
+            spec_embedding = self.internal_spec_encoder(spectra)  # [B, spec_dim]
+            
+            # 动态构建表格编码器
+            if self.internal_tab_encoder is None or self.tab_input_dim != tabular.shape[-1]:
+                self.tab_input_dim = tabular.shape[-1]
+                self.internal_tab_encoder = nn.Sequential(
+                    nn.Linear(self.tab_input_dim, 256),
+                    nn.LayerNorm(256),
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(256, self.clin_dim),
+                    nn.LayerNorm(self.clin_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.1)
+                ).to(tabular.device)
+            
+            tab_embedding = self.internal_tab_encoder(tabular)    # [B, clin_dim]
+        
+        # 融合特征
+        fused = torch.cat([spec_embedding, tab_embedding], dim=-1)   # [B, spec_dim + clin_dim]
+        logits = self.classifier(fused)                              # [B, num_classes]
         return {"embedding": fused, "logits": logits}
 
 
@@ -78,16 +135,74 @@ class ConcatFusion(nn.Module):
 class EnsembleFusion(nn.Module):
     def __init__(self, spec_dim=256, clin_dim=128, num_classes=2):
         super().__init__()
+        self.spec_dim = spec_dim
+        self.clin_dim = clin_dim
+        self.num_classes = num_classes
+        
+        # 内部编码器，用于处理原始输入
+        self.internal_spec_encoder = nn.Sequential(
+            nn.Conv1d(1, 64, kernel_size=7, padding=3),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(256, spec_dim),
+            nn.LayerNorm(spec_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        
+        # 表格编码器将在第一次前向传播时动态构建
+        self.internal_tab_encoder = None
+        self.tab_input_dim = None
+        
         self.spec_head = nn.Linear(spec_dim, num_classes)
         self.clin_head = nn.Linear(clin_dim, num_classes)
 
     def forward(self, spectra, mask=None, tabular=None):
-        logits_spec = self.spec_head(spectra)        # [B, C]
-        logits_clin = self.clin_head(tabular)        # [B, C]
-        logits = (logits_spec + logits_clin) / 2     # ensemble 平均
+        # 检查输入格式
+        if isinstance(spectra, dict) and isinstance(tabular, dict):
+            # 字典格式输入（来自外部模型）
+            spec_embedding = spectra["embedding"]
+            tab_embedding = tabular["embedding"]
+        else:
+            # 原始张量输入（来自假数据）
+            # 处理光谱数据：[B, num_scans, wavelengths] -> [B, wavelengths]
+            if spectra.dim() == 3:
+                spectra = spectra.mean(dim=1)  # 平均多个扫描
+            spectra = spectra.unsqueeze(1)  # [B, 1, wavelengths]
+            
+            spec_embedding = self.internal_spec_encoder(spectra)  # [B, spec_dim]
+            
+            # 动态构建表格编码器
+            if self.internal_tab_encoder is None or self.tab_input_dim != tabular.shape[-1]:
+                self.tab_input_dim = tabular.shape[-1]
+                self.internal_tab_encoder = nn.Sequential(
+                    nn.Linear(self.tab_input_dim, 256),
+                    nn.LayerNorm(256),
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(256, self.clin_dim),
+                    nn.LayerNorm(self.clin_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.1)
+                ).to(tabular.device)
+            
+            tab_embedding = self.internal_tab_encoder(tabular)    # [B, clin_dim]
+        
+        # 独立分类
+        logits_spec = self.spec_head(spec_embedding)        # [B, num_classes]
+        logits_clin = self.clin_head(tab_embedding)         # [B, num_classes]
+        logits = (logits_spec + logits_clin) / 2           # ensemble 平均
 
         # embedding 用拼接（方便和其他模型统一）
-        fused = torch.cat([spectra, tabular], dim=-1)  # [B, 384]
+        fused = torch.cat([spec_embedding, tab_embedding], dim=-1)  # [B, spec_dim + clin_dim]
         return {"embedding": fused, "logits": logits}
 
 
@@ -97,6 +212,11 @@ class EnsembleFusion(nn.Module):
 class BaselineMultimodal(nn.Module):
     def __init__(self, spec_embedding_dim=256, tab_embedding_dim=128, num_classes=2, fusion_type='concat'):
         super().__init__()
+        self.spec_embedding_dim = spec_embedding_dim
+        self.tab_embedding_dim = tab_embedding_dim
+        self.num_classes = num_classes
+        self.fusion_type = fusion_type
+        
         self.spec_encoder = SpectraEncoder(spec_embedding_dim=spec_embedding_dim, num_classes=num_classes)
         self.tab_encoder = TabularEncoder(tab_embedding_dim=tab_embedding_dim, num_classes=num_classes)
         
@@ -107,34 +227,66 @@ class BaselineMultimodal(nn.Module):
         else:
             raise ValueError(f"Unknown fusion type: {fusion_type}")
 
-    def forward(self, spectra_result, tabular_result, mask=None):
+    def forward(self, spectra_result=None, tabular_result=None, mask=None, spectra=None, tabular=None):
         """
-        接收来自外部模型的结果并进行融合
+        支持两种调用方式：
+        1. 接收来自外部模型的结果并进行融合（原始接口）
+        2. 接收原始张量输入（用于假数据训练）
         
         Args:
             spectra_result: dict from external spectra model {"embedding": [B, D_spec], "logits": [B, C]}
             tabular_result: dict from external tabular model {"embedding": [B, D_tab], "logits": [B, C]}
             mask: optional mask (for compatibility)
+            spectra: raw spectra tensor [B, num_scans, wavelengths] (for fake data)
+            tabular: raw tabular tensor [B, features] (for fake data)
         
         Returns:
             dict with fused results
         """
-        # 获取各模态的embedding和logits
-        spec_result = self.spec_encoder(spectra_result=spectra_result, mask=mask)
-        tab_result = self.tab_encoder(tabular_result=tabular_result, mask=mask)
+        # 检查是否是位置参数调用（来自训练器）
+        if isinstance(spectra_result, torch.Tensor) and isinstance(tabular_result, torch.Tensor):
+            # 位置参数调用：model(spectra, mask, tabular)
+            # spectra_result 实际是 spectra，tabular_result 实际是 mask，mask 实际是 tabular
+            spectra = spectra_result
+            tabular = mask  # mask 参数实际是 tabular
+            mask = tabular_result  # tabular_result 参数实际是 mask
+            spectra_result = None
+            tabular_result = None
         
-        # 融合两个模态的特征
-        fused_result = self.fusion(
-            spectra=spec_result["embedding"], 
-            tabular=tab_result["embedding"], 
-            mask=mask
-        )
+        # 检查输入格式
+        if spectra_result is not None and tabular_result is not None:
+            # 字典格式输入（来自外部模型）
+            spec_result = self.spec_encoder(spectra_result=spectra_result, mask=mask)
+            tab_result = self.tab_encoder(tabular_result=tabular_result, mask=mask)
+            
+            # 融合两个模态的特征
+            fused_result = self.fusion(
+                spectra=spec_result["embedding"], 
+                tabular=tab_result["embedding"], 
+                mask=mask
+            )
+            
+            return {
+                "embedding": fused_result["embedding"],
+                "logits": fused_result["logits"],
+                "spec_embedding": spec_result["embedding"],
+                "tab_embedding": tab_result["embedding"],
+                "spec_logits": spec_result["logits"],
+                "tab_logits": tab_result["logits"]
+            }
         
-        return {
-            "embedding": fused_result["embedding"],
-            "logits": fused_result["logits"],
-            "spec_embedding": spec_result["embedding"],
-            "tab_embedding": tab_result["embedding"],
-            "spec_logits": spec_result["logits"],
-            "tab_logits": tab_result["logits"]
-        }
+        elif spectra is not None and tabular is not None:
+            # 原始张量输入（来自假数据）
+            fused_result = self.fusion(
+                spectra=spectra,
+                tabular=tabular,
+                mask=mask
+            )
+            
+            return {
+                "embedding": fused_result["embedding"],
+                "logits": fused_result["logits"]
+            }
+        
+        else:
+            raise ValueError("Either (spectra_result, tabular_result) or (spectra, tabular) must be provided")

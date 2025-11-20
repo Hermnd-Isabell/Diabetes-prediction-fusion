@@ -393,6 +393,46 @@ class EnhancedMMTMFusion(nn.Module):
             hidden_dims=[fused_dim // 2, fused_dim // 4]
         )
         
+        # 添加内部编码器，用于处理原始输入
+        self.internal_spec_encoder = self._build_spectral_encoder()
+        self.internal_tab_encoder = self._build_tabular_encoder()
+        self.internal_spec_classifier = nn.Linear(spec_embedding_dim, num_classes)
+        self.internal_tab_classifier = nn.Linear(tab_embedding_dim, num_classes)
+    
+    def _build_spectral_encoder(self):
+        """构建内部光谱编码器"""
+        return nn.Sequential(
+            # 扫描级特征提取
+            nn.Conv1d(1, 64, kernel_size=7, padding=3),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, kernel_size=5, padding=2),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),  # 全局平均池化
+            nn.Flatten(),
+            nn.Linear(256, self.spec_embedding_dim),
+            nn.LayerNorm(self.spec_embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+    
+    def _build_tabular_encoder(self):
+        """构建内部表格编码器"""
+        return nn.Sequential(
+            nn.Linear(10, 256),  # 假设表格特征维度为10
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, self.tab_embedding_dim),
+            nn.LayerNorm(self.tab_embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        
     def _calculate_hierarchical_fusion_dim(self) -> int:
         """计算层次化融合后的维度"""
         total_dim = 0
@@ -404,19 +444,53 @@ class EnhancedMMTMFusion(nn.Module):
             total_dim += 3 * min_dim
         return total_dim
     
-    def forward(self, spectra_result: Dict, tabular_result: Dict) -> Dict:
+    def forward(self, *args):
         """
+        支持两种调用方式的前向传播
+        
         Args:
-            spectra_result: dict with keys ['embedding', 'logits']
-            tabular_result: dict with keys ['embedding', 'logits']
-        Returns:
-            dict with comprehensive output information
+            方式1: spectra_result, tabular_result (dict格式)
+            方式2: spectra, mask, tabular (原始张量格式)
         """
-        # 提取外部模型输出
-        spec_emb = spectra_result['embedding']
-        tab_emb = tabular_result['embedding']
-        spec_logits = spectra_result['logits']
-        tab_logits = tabular_result['logits']
+        if len(args) == 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
+            # 原始方式：字典格式输入
+            spectra_result, tabular_result = args
+            spec_emb = spectra_result['embedding']
+            tab_emb = tabular_result['embedding']
+            spec_logits = spectra_result['logits']
+            tab_logits = tabular_result['logits']
+            
+        elif len(args) == 3:
+            # 新方式：处理原始张量输入
+            spectra, mask, tabular = args
+            
+            # 处理光谱数据：[B, S, L] -> [B*S, L] -> [B*S, 1, L]
+            B, S, L = spectra.shape
+            spectra_flat = spectra.view(B * S, L).unsqueeze(1)  # [B*S, 1, L]
+            
+            # 通过内部光谱编码器
+            spec_features = self.internal_spec_encoder(spectra_flat)  # [B*S, spec_embedding_dim]
+            
+            # 重新reshape并做注意力池化
+            spec_features = spec_features.view(B, S, -1)  # [B, S, spec_embedding_dim]
+            
+            # 使用mask进行注意力池化
+            if mask is not None:
+                # 简单的掩码平均池化
+                mask_expanded = mask.unsqueeze(-1).float()  # [B, S, 1]
+                spec_emb = (spec_features * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-8)
+            else:
+                spec_emb = spec_features.mean(dim=1)  # [B, spec_embedding_dim]
+            
+            # 处理表格数据
+            tab_emb = self.internal_tab_encoder(tabular)  # [B, tab_embedding_dim]
+            
+            # 生成内部logits（用于损失计算）
+            spec_logits = self.internal_spec_classifier(spec_emb)
+            tab_logits = self.internal_tab_classifier(tab_emb)
+            
+        else:
+            raise ValueError(f"❌ 不支持的参数数量: {len(args)}")
         
         # 增强版MMTM处理
         spec_enhanced, tab_enhanced, mmtm_info = self.enhanced_mmtm(spec_emb, tab_emb)

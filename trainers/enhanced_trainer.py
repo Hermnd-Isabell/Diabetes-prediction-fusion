@@ -152,9 +152,9 @@ class EnhancedTrainer:
             probs = torch.softmax(logits, dim=1)
             preds = torch.argmax(logits, dim=1)
             
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs[:, 1].cpu().numpy())
+            all_preds.extend(preds.detach().cpu().numpy())
+            all_labels.extend(labels.detach().cpu().numpy())
+            all_probs.extend(probs[:, 1].detach().cpu().numpy())
             
             # 更新进度条
             pbar.set_postfix({
@@ -198,9 +198,9 @@ class EnhancedTrainer:
                 probs = torch.softmax(logits, dim=1)
                 preds = torch.argmax(logits, dim=1)
                 
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                all_probs.extend(probs[:, 1].cpu().numpy())
+                all_preds.extend(preds.detach().cpu().numpy())
+                all_labels.extend(labels.detach().cpu().numpy())
+                all_probs.extend(probs[:, 1].detach().cpu().numpy())
                 
                 # 收集特征用于可视化
                 if 'embedding' in outputs:
@@ -385,9 +385,9 @@ class EnhancedTrainer:
                 preds = torch.argmax(logits, dim=1)
                 
                 # 收集结果
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                all_probs.extend(probs[:, 1].cpu().numpy())
+                all_preds.extend(preds.detach().cpu().numpy())
+                all_labels.extend(labels.detach().cpu().numpy())
+                all_probs.extend(probs[:, 1].detach().cpu().numpy())
                 
                 # 收集特征和注意力权重
                 if 'embedding' in outputs:
@@ -413,15 +413,23 @@ class EnhancedTrainer:
         
         # 生成可视化
         if generate_plots and self.enable_visualization:
+            # 确保特征和注意力权重是numpy数组
+            features_array = np.vstack(all_features) if all_features else None
+            attention_array = np.vstack(all_attention_weights) if all_attention_weights else None
+            
             self._generate_evaluation_plots(
                 all_labels, all_probs, all_preds,
-                all_features, all_attention_weights
+                features_array, attention_array
             )
         
         # 可解释性分析
         if self.enable_interpretability:
+            # 确保特征和注意力权重是numpy数组
+            features_array = np.vstack(all_features) if all_features else None
+            attention_array = np.vstack(all_attention_weights) if all_attention_weights else None
+            
             self._generate_interpretability_analysis(
-                test_loader, all_features, all_attention_weights
+                test_loader, features_array, attention_array
             )
         
         return {
@@ -601,38 +609,53 @@ class EnhancedTrainer:
             sample_mask = sample_mask[:5].to(self.device)
         sample_tabular = sample_batch["tabular"][:5].to(self.device)
         
-        # 创建SHAP解释器
+        # 创建简化的特征重要性分析（替代SHAP）
         try:
-            def model_predict(spectra_batch, tabular_batch):
-                """SHAP包装函数"""
-                self.model.eval()
-                with torch.no_grad():
-                    outputs = self.model(spectra_batch, sample_mask, tabular_batch)
-                    return torch.softmax(outputs["logits"], dim=1)[:, 1].cpu().numpy()
+            # 使用梯度分析替代SHAP，更简单可靠
+            single_spectra = sample_spectra[:1]  # 只分析第一个样本
+            single_mask = sample_mask[:1] if sample_mask is not None else None
+            single_tabular = sample_tabular[:1]
             
-            # 创建背景数据
-            background_spectra = sample_spectra[:2]
-            background_tabular = sample_tabular[:2]
+            # 计算梯度重要性
+            single_spectra.requires_grad_(True)
+            outputs = self.model(single_spectra, single_mask, single_tabular)
+            loss = outputs["logits"].sum()
+            loss.backward()
             
-            # SHAP分析
-            explainer = shap.Explainer(
-                lambda x: model_predict(torch.tensor(x).to(self.device), background_tabular),
-                background_spectra.cpu().numpy()
-            )
-            shap_values = explainer(sample_spectra.cpu().numpy())
+            # 获取梯度作为特征重要性
+            feature_importance = torch.abs(single_spectra.grad).cpu().numpy().flatten()
             
-            # 可视化SHAP值
+            # 可视化特征重要性
             plt.figure(figsize=(12, 8))
-            shap.summary_plot(shap_values, sample_spectra.cpu().numpy(), show=False)
-            plt.title(f'{self.model_name} - SHAP特征重要性')
+            plt.plot(feature_importance)
+            plt.title(f'{self.model_name} - 特征重要性 (基于梯度)')
+            plt.xlabel('波长索引')
+            plt.ylabel('梯度重要性')
+            plt.grid(True, alpha=0.3)
             plt.tight_layout()
             plt.savefig(self.save_dir / 'shap_analysis.png', dpi=300, bbox_inches='tight')
             plt.close()
             
-            print(f"✅ SHAP分析已保存: {self.save_dir / 'shap_analysis.png'}")
+            print(f"✅ 特征重要性分析已保存: {self.save_dir / 'shap_analysis.png'}")
             
         except Exception as e:
             print(f"⚠️  SHAP分析失败: {e}")
+            # 如果SHAP失败，至少生成一个简单的特征重要性图
+            try:
+                plt.figure(figsize=(12, 8))
+                # 使用简单的特征重要性可视化
+                feature_importance = np.abs(sample_spectra.cpu().numpy().mean(axis=0))
+                plt.plot(feature_importance.mean(axis=0))
+                plt.title(f'{self.model_name} - 特征重要性 (替代SHAP)')
+                plt.xlabel('波长索引')
+                plt.ylabel('平均强度')
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(self.save_dir / 'feature_importance.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                print(f"✅ 特征重要性图已保存: {self.save_dir / 'feature_importance.png'}")
+            except Exception as e2:
+                print(f"⚠️  特征重要性图也失败: {e2}")
         
         # 特征重要性分析
         if features is not None:
@@ -645,23 +668,30 @@ class EnhancedTrainer:
     def _analyze_feature_importance(self, features: np.ndarray):
         """分析特征重要性"""
         # 使用PCA分析特征重要性
-        if features.shape[1] > 2:
-            pca = PCA(n_components=min(10, features.shape[1]))
-            pca.fit(features)
-            
-            # 可视化主成分贡献
-            plt.figure(figsize=(10, 6))
-            plt.bar(range(1, len(pca.explained_variance_ratio_) + 1), 
-                   pca.explained_variance_ratio_)
-            plt.xlabel('主成分')
-            plt.ylabel('解释方差比')
-            plt.title(f'{self.model_name} - 主成分分析')
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(self.save_dir / 'pca_analysis.png', dpi=300, bbox_inches='tight')
-            plt.close()
-            
-            print(f"✅ PCA分析已保存: {self.save_dir / 'pca_analysis.png'}")
+        if features.shape[0] > 1 and features.shape[1] > 1:
+            # 确保n_components不超过样本数和特征数
+            max_components = min(10, features.shape[0] - 1, features.shape[1])
+            if max_components > 0:
+                pca = PCA(n_components=max_components)
+                pca.fit(features)
+                
+                # 可视化主成分贡献
+                plt.figure(figsize=(10, 6))
+                plt.bar(range(1, len(pca.explained_variance_ratio_) + 1), 
+                       pca.explained_variance_ratio_)
+                plt.xlabel('主成分')
+                plt.ylabel('解释方差比')
+                plt.title(f'{self.model_name} - 主成分分析')
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(self.save_dir / 'pca_analysis.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                
+                print(f"✅ PCA分析已保存: {self.save_dir / 'pca_analysis.png'}")
+            else:
+                print("⚠️  样本数量不足，跳过PCA分析")
+        else:
+            print("⚠️  特征数据不足，跳过PCA分析")
     
     def _analyze_attention_patterns(self, attention_weights: np.ndarray):
         """分析注意力模式"""

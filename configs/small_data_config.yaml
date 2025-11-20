@@ -1,0 +1,71 @@
+# 小数据量训练配置文件
+# 专门用于测试 AttentionMultimodal 模型
+
+# 数据配置
+data:
+  # 使用假数据生成器
+  use_fake_data: true
+  fake_data_samples: 200
+  fake_data_scans: 3
+  fake_data_wavelengths: 1000
+  fake_data_features: 10
+  
+  # 数据划分
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+# 模型配置
+model:
+  name: AttentionMultimodal
+  num_classes: 2
+  spec_emb: 256
+  tab_emb: 128
+  fusion: enhanced_cross
+
+# 训练配置
+train:
+  batch_size: 8
+  lr: 0.001
+  weight_decay: 0.0001
+  epochs: 20
+  early_stopping_patience: 5
+  save_dir: small_data_results
+
+# 可视化配置
+visualization:
+  enable: true
+  save_plots: true
+  plot_format: png
+  dpi: 300
+  
+  # 训练过程可视化
+  plot_training_curves: true
+  plot_validation_curves: true
+  
+  # 评估可视化
+  plot_roc_curves: true
+  plot_confusion_matrix: true
+  plot_precision_recall: true
+  plot_prediction_distribution: true
+  plot_feature_visualization: true
+
+# 可解释性分析配置
+interpretability:
+  enable: true
+  
+  # 特征重要性分析
+  feature_importance: true
+  pca_analysis: true
+  tsne_analysis: true
+  
+  # 注意：小数据量下不启用SHAP分析（需要更多样本）
+  shap_analysis: false
+  attention_analysis: false
+  gradcam_analysis: false
+
+# 模型比较配置
+comparison:
+  enable: false  # 小数据量下不进行模型比较
+
+

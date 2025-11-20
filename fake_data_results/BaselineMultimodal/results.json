@@ -1,0 +1,79 @@
+{
+  "model_name": "BaselineMultimodal",
+  "training_result": {
+    "best_val_auc": 0.38009049773755654,
+    "best_epoch": 0,
+    "total_time": 0.5728051662445068,
+    "train_history": {
+      "loss": [
+        0.7657190305846078
+      ],
+      "acc": [
+        0.5571428571428572
+      ],
+      "auc": [
+        0.5353535353535354
+      ],
+      "f1": [
+        0.5580512820512821
+      ]
+    },
+    "val_history": {
+      "loss": [
+        0.9115485986073811
+      ],
+      "acc": [
+        0.43333333333333335
+      ],
+      "auc": [
+        0.38009049773755654
+      ],
+      "f1": [
+        0.262015503875969
+      ]
+    }
+  },
+  "test_result": {
+    "metrics": {
+      "acc": 0.5333333333333333,
+      "auc": 0.49107142857142855,
+      "f1": 0.3710144927536232,
+      "sensitivity@90%spec": 0.07142857142857142
+    },
+    "classification_report": {
+      "Control": {
+        "precision": 0.5333333333333333,
+        "recall": 1.0,
+        "f1-score": 0.6956521739130435,
+        "support": 16.0
+      },
+      "DM": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1-score": 0.0,
+        "support": 14.0
+      },
+      "accuracy": 0.5333333333333333,
+      "macro avg": {
+        "precision": 0.26666666666666666,
+        "recall": 0.5,
+        "f1-score": 0.34782608695652173,
+        "support": 30.0
+      },
+      "weighted avg": {
+        "precision": 0.28444444444444444,
+        "recall": 0.5333333333333333,
+        "f1-score": 0.3710144927536232,
+        "support": 30.0
+      }
+    }
+  },
+  "model_summary": {
+    "model_name": "BaselineMultimodal",
+    "total_parameters": 306434,
+    "trainable_parameters": 306434,
+    "model_size_mb": 1.1689529418945312,
+    "best_val_auc": 0.0,
+    "device": "cuda"
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "model_name": "AttentionMultimodal",
+  "training_result": {
+    "best_val_auc": 0.4796380090497738,
+    "best_epoch": 0,
+    "total_time": 1.100762128829956,
+    "train_history": {
+      "loss": [
+        0.7564825807298933
+      ],
+      "acc": [
+        0.5214285714285715
+      ],
+      "auc": [
+        0.5254586683158112
+      ],
+      "f1": [
+        0.5144927536231884
+      ]
+    },
+    "val_history": {
+      "loss": [
+        0.7670796712239584
+      ],
+      "acc": [
+        0.43333333333333335
+      ],
+      "auc": [
+        0.4796380090497738
+      ],
+      "f1": [
+        0.262015503875969
+      ]
+    }
+  },
+  "test_result": {
+    "metrics": {
+      "acc": 0.5333333333333333,
+      "auc": 0.5625,
+      "f1": 0.3710144927536232,
+      "sensitivity@90%spec": 0.2857142857142857
+    },
+    "classification_report": {
+      "Control": {
+        "precision": 0.5333333333333333,
+        "recall": 1.0,
+        "f1-score": 0.6956521739130435,
+        "support": 16.0
+      },
+      "DM": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1-score": 0.0,
+        "support": 14.0
+      },
+      "accuracy": 0.5333333333333333,
+      "macro avg": {
+        "precision": 0.26666666666666666,
+        "recall": 0.5,
+        "f1-score": 0.34782608695652173,
+        "support": 30.0
+      },
+      "weighted avg": {
+        "precision": 0.28444444444444444,
+        "recall": 0.5333333333333333,
+        "f1-score": 0.3710144927536232,
+        "support": 30.0
+      }
+    }
+  },
+  "model_summary": {
+    "model_name": "AttentionMultimodal",
+    "total_parameters": 2359142,
+    "trainable_parameters": 2359142,
+    "model_size_mb": 8.999412536621094,
+    "best_val_auc": 0.0,
+    "device": "cuda"
+  }
+}

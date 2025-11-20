@@ -551,8 +551,12 @@ class AttentionMultimodal(EnhancedAttentionMultimodal):
     """
     向后兼容的注意力融合模型
     默认使用增强的跨模态注意力机制
+    
+    支持两种调用方式：
+    1. model(spectra_result, tabular_result) - 原始方式，需要预计算的embedding/logits
+    2. model(spectra, mask, tabular) - 新方式，直接从原始数据计算
     """
-    def __init__(self, spec_embedding_dim=256, tab_embedding_dim=128, num_classes=2, fusion_type='enhanced_cross'):
+    def __init__(self, spec_embedding_dim=256, tab_embedding_dim=128, num_classes=2, fusion_type='enhanced_cross', tab_dim=None):
         super().__init__(
             spec_embedding_dim=spec_embedding_dim,
             tab_embedding_dim=tab_embedding_dim,
@@ -561,6 +565,100 @@ class AttentionMultimodal(EnhancedAttentionMultimodal):
             use_auxiliary=True,
             hidden_dims=[512, 256, 128]
         )
+        
+        # 保存属性（确保在调用_build方法之前设置）
+        self.num_classes = num_classes
+        self.spec_embedding_dim = spec_embedding_dim
+        self.tab_embedding_dim = tab_embedding_dim
+        
+        # 添加内部编码器，用于处理原始输入
+        self.internal_spec_encoder = self._build_spectral_encoder()
+        self.internal_tab_encoder = self._build_tabular_encoder(tab_dim or 128)
+    
+    def _build_spectral_encoder(self):
+        """构建内部光谱编码器"""
+        return nn.Sequential(
+            # 扫描级特征提取
+            ResidualConv1D(1, 64, kernel_size=7),
+            ResidualConv1D(64, 128, kernel_size=5),
+            ResidualConv1D(128, 256, kernel_size=3),
+            nn.AdaptiveAvgPool1d(1),  # 全局平均池化
+            nn.Flatten(),
+            nn.Linear(256, self.spec_embedding_dim),
+            nn.LayerNorm(self.spec_embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+    
+    def _build_tabular_encoder(self, tab_dim):
+        """构建内部表格编码器"""
+        return nn.Sequential(
+            nn.Linear(tab_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, self.tab_embedding_dim),
+            nn.LayerNorm(self.tab_embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+    
+    def forward(self, *args):
+        """
+        支持两种调用方式的前向传播
+        
+        Args:
+            方式1: spectra_result, tabular_result (dict格式)
+            方式2: spectra, mask, tabular (原始张量格式)
+        """
+        if len(args) == 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
+            # 原始方式：直接调用父类方法
+            return super().forward(args[0], args[1])
+        
+        elif len(args) == 3:
+            # 新方式：处理原始张量输入，确保两个维度都是embedding和logits格式
+            spectra, mask, tabular = args
+            
+            # 处理光谱数据：[B, S, L] -> [B*S, L] -> [B*S, 1, L]
+            B, S, L = spectra.shape
+            spectra_flat = spectra.view(B * S, L).unsqueeze(1)  # [B*S, 1, L]
+            
+            # 通过内部光谱编码器
+            spec_features = self.internal_spec_encoder(spectra_flat)  # [B*S, spec_embedding_dim]
+            
+            # 重新reshape并做注意力池化
+            spec_features = spec_features.view(B, S, -1)  # [B, S, spec_embedding_dim]
+            
+            # 使用mask进行注意力池化
+            if mask is not None:
+                # 简单的掩码平均池化
+                mask_expanded = mask.unsqueeze(-1).float()  # [B, S, 1]
+                spec_embedding = (spec_features * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+            else:
+                spec_embedding = spec_features.mean(dim=1)  # [B, spec_embedding_dim]
+            
+            # 处理表格数据
+            tab_embedding = self.internal_tab_encoder(tabular)  # [B, tab_embedding_dim]
+            
+            # 为每个模态创建独立的分类器来生成logits
+            spec_logits = self.aux_spec_classifier(spec_embedding)  # [B, num_classes]
+            tab_logits = self.aux_tab_classifier(tab_embedding)    # [B, num_classes]
+            
+            # 创建字典格式 - 确保两个维度都是embedding和logits格式
+            spectra_result = {
+                "embedding": spec_embedding,
+                "logits": spec_logits
+            }
+            tabular_result = {
+                "embedding": tab_embedding,
+                "logits": tab_logits
+            }
+            
+            # 调用父类方法
+            return super().forward(spectra_result, tabular_result)
+        
+        else:
+            raise ValueError(f"不支持的参数数量: {len(args)}. 支持: (spectra_result, tabular_result) 或 (spectra, mask, tabular)")
 
 
 # ----------------------------

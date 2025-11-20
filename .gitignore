@@ -121,6 +121,7 @@ dmypy.json
 # Data files (uncomment if you want to exclude data)
 # data/
 # datasets/
+data/spectra.csv
 
 # Results and logs
 results/

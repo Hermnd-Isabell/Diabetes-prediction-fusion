@@ -1,0 +1,79 @@
+{
+  "model_name": "EnhancedMMTMFusion",
+  "training_result": {
+    "best_val_auc": 0.47511312217194573,
+    "best_epoch": 0,
+    "total_time": 1.1426537036895752,
+    "train_history": {
+      "loss": [
+        0.7137607915060861
+      ],
+      "acc": [
+        0.5928571428571429
+      ],
+      "auc": [
+        0.562358276643991
+      ],
+      "f1": [
+        0.5908467176048652
+      ]
+    },
+    "val_history": {
+      "loss": [
+        0.9488100369771322
+      ],
+      "acc": [
+        0.43333333333333335
+      ],
+      "auc": [
+        0.47511312217194573
+      ],
+      "f1": [
+        0.262015503875969
+      ]
+    }
+  },
+  "test_result": {
+    "metrics": {
+      "acc": 0.5333333333333333,
+      "auc": 0.4776785714285714,
+      "f1": 0.3710144927536232,
+      "sensitivity@90%spec": 0.07142857142857142
+    },
+    "classification_report": {
+      "Control": {
+        "precision": 0.5333333333333333,
+        "recall": 1.0,
+        "f1-score": 0.6956521739130435,
+        "support": 16.0
+      },
+      "DM": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1-score": 0.0,
+        "support": 14.0
+      },
+      "accuracy": 0.5333333333333333,
+      "macro avg": {
+        "precision": 0.26666666666666666,
+        "recall": 0.5,
+        "f1-score": 0.34782608695652173,
+        "support": 30.0
+      },
+      "weighted avg": {
+        "precision": 0.28444444444444444,
+        "recall": 0.5333333333333333,
+        "f1-score": 0.3710144927536232,
+        "support": 30.0
+      }
+    }
+  },
+  "model_summary": {
+    "model_name": "EnhancedMMTMFusion",
+    "total_parameters": 1613227,
+    "trainable_parameters": 1613227,
+    "model_size_mb": 6.153972625732422,
+    "best_val_auc": 0.0,
+    "device": "cuda"
+  }
+}
