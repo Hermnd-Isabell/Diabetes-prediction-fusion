@@ -26,6 +26,7 @@ import warnings
 
 # 导入数据集和训练器
 from datasets.raman_dataset import RamanDataset, collate_fn, preprocess_spectrum
+from datasets.embedding_dataset import EmbeddingMultimodalDataset, embedding_collate_fn
 from trainers.enhanced_trainer import EnhancedTrainer, compare_models
 
 # 导入所有模型
@@ -59,7 +60,18 @@ def build_model(cfg: dict, tab_dim: int, spec_len: int) -> torch.nn.Module:
     model_name = cfg["model"]["name"]
     num_classes = cfg["model"]["num_classes"]
     
-    print(f"🏗️  构建模型: {model_name}")
+    print(f"[BUILD] 构建模型: {model_name}")
+
+    # 根据当前是否使用 embedding 模式，确定各模态 embedding 维度
+    use_embedding = cfg.get("data", {}).get("use_embedding", False)
+    if use_embedding:
+        # 在 embedding 模式下，直接使用数据集中实际的 embedding 维度
+        spec_emb_dim = spec_len
+        tab_emb_dim = tab_dim
+    else:
+        # 在 raw 模式下，使用配置中的默认 embedding 维度
+        spec_emb_dim = cfg["model"].get("spec_emb", 256)
+        tab_emb_dim = cfg["model"].get("tab_emb", 128)
     
     if model_name == "Spectra-only":
         return SpectraEncoder(input_dim=spec_len, hidden_dim=256)
@@ -68,10 +80,21 @@ def build_model(cfg: dict, tab_dim: int, spec_len: int) -> torch.nn.Module:
         return TabularEncoder(input_dim=tab_dim, hidden_dim=128)
     
     elif model_name == "ConcatFusion":
-        return ConcatFusion(spec_dim=256, clin_dim=128)
+        return ConcatFusion(spec_dim=spec_emb_dim, clin_dim=tab_emb_dim)
     
     elif model_name == "EnsembleFusion":
-        return EnsembleFusion(spec_dim=256, clin_dim=128)
+        return EnsembleFusion(spec_dim=spec_emb_dim, clin_dim=tab_emb_dim)
+    
+    elif model_name == "BaselineMultimodal":
+        # BaselineMultimodal 是一个包装类，需要指定 fusion_type
+        from models.Baseline import BaselineMultimodal
+        fusion_type = cfg["model"].get("fusion_type", "concat")
+        return BaselineMultimodal(
+            spec_embedding_dim=spec_emb_dim,
+            tab_embedding_dim=tab_emb_dim,
+            num_classes=num_classes,
+            fusion_type=fusion_type
+        )
     
     elif model_name == "AttentionMultimodal":
         # 兼容旧配置中的 fusion 取值
@@ -84,8 +107,8 @@ def build_model(cfg: dict, tab_dim: int, spec_len: int) -> torch.nn.Module:
         fusion_type = fusion_map.get(fusion_cfg, fusion_cfg)
 
         return AttentionMultimodal(
-            spec_embedding_dim=cfg["model"].get("spec_emb", 256),
-            tab_embedding_dim=cfg["model"].get("tab_emb", 128),
+            spec_embedding_dim=spec_emb_dim,
+            tab_embedding_dim=tab_emb_dim,
             num_classes=num_classes,
             fusion_type=fusion_type,
             tab_dim=tab_dim
@@ -95,16 +118,16 @@ def build_model(cfg: dict, tab_dim: int, spec_len: int) -> torch.nn.Module:
         return TFTMultimodal(
             tab_dim=tab_dim,
             spec_len=spec_len,
-            spec_emb=cfg["model"].get("spec_emb", 256),
-            tab_emb=cfg["model"].get("tab_emb", 128),
+            spec_emb=spec_emb_dim,
+            tab_emb=tab_emb_dim,
             num_classes=num_classes
         )
     
     
     elif model_name == "EnhancedMMTM":
         return EnhancedMMTMFusion(
-            spec_embedding_dim=cfg["model"].get("spec_emb", 256),
-            tab_embedding_dim=cfg["model"].get("tab_emb", 128),
+            spec_embedding_dim=spec_emb_dim,
+            tab_embedding_dim=tab_emb_dim,
             num_classes=num_classes,
             mmtm_bottleneck=cfg["model"].get("mmtm_bottleneck", 128),
             num_attention_heads=cfg["model"].get("num_attention_heads", 8),
@@ -113,7 +136,7 @@ def build_model(cfg: dict, tab_dim: int, spec_len: int) -> torch.nn.Module:
         )
     
     else:
-        raise ValueError(f"❌ 未知模型名称: {model_name}")
+        raise ValueError(f"[ERROR] 未知模型名称: {model_name}")
 
 
 def prepare_data(cfg: dict) -> tuple:
@@ -126,8 +149,96 @@ def prepare_data(cfg: dict) -> tuple:
     Returns:
         (train_loader, val_loader, test_loader, dataset_info)
     """
-    print("📊 准备数据集...")
+    print("[DATA] 准备数据集...")
     
+    use_embedding = cfg["data"].get("use_embedding", False)
+
+    if use_embedding:
+        # -----------------------------
+        # embedding 模式：从 CSV 加载已对齐的单模态 embedding
+        # -----------------------------
+        from multimodal.embedding_loader import (
+            load_spectrum_embedding,
+            load_clinical_embedding,
+            align_by_patient_id,
+        )
+
+        spec_path = cfg["data"]["spectrum_embedding_path"]
+        clin_path = cfg["data"]["clinical_embedding_path"]
+
+        print(f"[DATA] 使用 embedding 模式加载数据")
+        print(f"   - 光谱 embedding: {spec_path}")
+        print(f"   - 临床 embedding: {clin_path}")
+
+        spectrum_dict = load_spectrum_embedding(spec_path)
+        clinical_dict = load_clinical_embedding(clin_path)
+        aligned = align_by_patient_id(spectrum_dict, clinical_dict)
+
+        # 获取模态 dropout 配置（仅在训练集使用）
+        dropout_cfg = cfg["train"].get("modality_dropout", {"spectra": 0.0, "clinical": 0.0})
+        
+        # 基于 split 字段构建三个 Dataset
+        # 训练集可以使用 dropout，验证/测试集严禁 dropout
+        train_set = EmbeddingMultimodalDataset(
+            aligned, split="train", dropout_config=dropout_cfg
+        )
+        val_set = EmbeddingMultimodalDataset(
+            aligned, split="val", dropout_config={"spectra": 0.0, "clinical": 0.0}
+        )
+        test_set = EmbeddingMultimodalDataset(
+            aligned, split="test", dropout_config={"spectra": 0.0, "clinical": 0.0}
+        )
+        
+        # 打印 dropout 配置信息
+        if dropout_cfg.get("spectra", 0.0) > 0 or dropout_cfg.get("clinical", 0.0) > 0:
+            print(f"[DATA] 模态 Dropout 配置:")
+            print(f"   - 光谱 dropout 概率: {dropout_cfg.get('spectra', 0.0):.2f}")
+            print(f"   - 临床 dropout 概率: {dropout_cfg.get('clinical', 0.0):.2f}")
+            print(f"   - 注意: Dropout 仅在训练集生效，验证/测试集不使用")
+
+        print(f"[DATA] Embedding 数据划分: 训练={len(train_set)}, 验证={len(val_set)}, 测试={len(test_set)}")
+
+        batch_size = cfg["train"]["batch_size"]
+        train_loader = DataLoader(
+            train_set, batch_size=batch_size, shuffle=True, collate_fn=embedding_collate_fn
+        )
+        val_loader = DataLoader(
+            val_set, batch_size=batch_size, shuffle=False, collate_fn=embedding_collate_fn
+        )
+        test_loader = DataLoader(
+            test_set, batch_size=batch_size, shuffle=False, collate_fn=embedding_collate_fn
+        )
+
+        # 从任意非空子集推断维度信息
+        ref_items = (
+            train_set.items if len(train_set) > 0
+            else (val_set.items if len(val_set) > 0 else test_set.items)
+        )
+        if not ref_items:
+            raise ValueError("对齐后的 embedding 数据为空，无法构建数据集")
+
+        tab_dim = ref_items[0]["tabular"].shape[0]
+        spec_len = ref_items[0]["spectra"].shape[0]
+        labels_all = [it["label"] for it in ref_items]
+
+        dataset_info = {
+            "tab_dim": tab_dim,
+            "spec_len": spec_len,
+            "num_classes": len(set(labels_all)),
+            "class_distribution": pd.Series(labels_all).value_counts().to_dict(),
+        }
+
+        print(f"[DATA] Embedding 数据集信息:")
+        print(f"   - 表格特征维度 (Dc): {dataset_info['tab_dim']}")
+        print(f"   - 光谱特征维度 (Ds): {dataset_info['spec_len']}")
+        print(f"   - 类别数: {dataset_info['num_classes']}")
+        print(f"   - 类别分布: {dataset_info['class_distribution']}")
+
+        return train_loader, val_loader, test_loader, dataset_info
+
+    # -----------------------------
+    # 原始 raw 模式：RamanDataset + 光谱序列
+    # -----------------------------
     # 数据路径
     spectra_csv = cfg["data"]["spectra_csv"]
     clinical_csv = cfg["data"]["clinical_csv"]
@@ -144,10 +255,10 @@ def prepare_data(cfg: dict) -> tuple:
         label_col=cfg["data"].get("label_col", "Group"),
         preprocess_fn=preprocess_spectrum,
         min_scans=1,
-        max_scans=cfg["data"].get("max_scans", 180)
+        max_scans=cfg["data"].get("max_scans", 180),
     )
     
-    print(f"✅ 数据集加载完成: {len(dataset)} 个样本")
+    print(f"[OK] 数据集加载完成: {len(dataset)} 个样本")
     
     # 数据划分
     train_ratio = cfg["data"].get("train_ratio", 0.7)
@@ -169,7 +280,7 @@ def prepare_data(cfg: dict) -> tuple:
         generator=torch.Generator().manual_seed(42)
     )
     
-    print(f"📊 数据划分: 训练={len(train_set)}, 验证={len(val_set)}, 测试={len(test_set)}")
+    print(f"[DATA] 数据划分: 训练={len(train_set)}, 验证={len(val_set)}, 测试={len(test_set)}")
     
     # 创建数据加载器
     batch_size = cfg["train"]["batch_size"]
@@ -191,11 +302,11 @@ def prepare_data(cfg: dict) -> tuple:
         'class_distribution': pd.Series([item["label"] for item in dataset.items]).value_counts().to_dict()
     }
     
-    print(f"📊 数据集信息:")
-    print(f"   • 表格特征维度: {dataset_info['tab_dim']}")
-    print(f"   • 光谱长度: {dataset_info['spec_len']}")
-    print(f"   • 类别数: {dataset_info['num_classes']}")
-    print(f"   • 类别分布: {dataset_info['class_distribution']}")
+    print(f"[DATA] 数据集信息:")
+    print(f"   - 表格特征维度: {dataset_info['tab_dim']}")
+    print(f"   - 光谱长度: {dataset_info['spec_len']}")
+    print(f"   - 类别数: {dataset_info['num_classes']}")
+    print(f"   - 类别分布: {dataset_info['class_distribution']}")
     
     return train_loader, val_loader, test_loader, dataset_info
 
@@ -225,6 +336,11 @@ def train_single_model(
     # 使用指定的模型名称或配置中的名称
     if model_name:
         cfg["model"]["name"] = model_name
+
+    # 确保模型的类别数与数据集一致（避免 config 中 num_classes 配错）
+    if "num_classes" in dataset_info:
+        cfg.setdefault("model", {})
+        cfg["model"]["num_classes"] = int(dataset_info["num_classes"])
     
     # 构建模型
     model = build_model(cfg, dataset_info['tab_dim'], dataset_info['spec_len'])
@@ -233,6 +349,7 @@ def train_single_model(
     lr_value = float(cfg["train"].get("lr", 1e-3))
     wd_raw = cfg["train"].get("weight_decay", 1e-4)
     weight_decay_value = float(wd_raw) if wd_raw is not None else 0.0
+    use_embedding_input = cfg.get("data", {}).get("use_embedding", False)
 
     trainer = EnhancedTrainer(
         model=model,
@@ -242,17 +359,18 @@ def train_single_model(
         weight_decay=weight_decay_value,
         save_dir=cfg["train"].get("save_dir", "results"),
         enable_visualization=cfg.get("visualization", {}).get("enable", True),
-        enable_interpretability=cfg.get("interpretability", {}).get("enable", True)
+        enable_interpretability=cfg.get("interpretability", {}).get("enable", True),
+        use_embedding_input=use_embedding_input,
     )
     
     # 打印模型信息
     model_summary = trainer.get_model_summary()
-    print(f"\n📊 模型摘要:")
-    print(f"   • 模型名称: {model_summary['model_name']}")
-    print(f"   • 总参数数: {model_summary['total_parameters']:,}")
-    print(f"   • 可训练参数: {model_summary['trainable_parameters']:,}")
-    print(f"   • 模型大小: {model_summary['model_size_mb']:.2f} MB")
-    print(f"   • 设备: {model_summary['device']}")
+    print(f"\n[MODEL] 模型摘要:")
+    print(f"   - 模型名称: {model_summary['model_name']}")
+    print(f"   - 总参数数: {model_summary['total_parameters']:,}")
+    print(f"   - 可训练参数: {model_summary['trainable_parameters']:,}")
+    print(f"   - 模型大小: {model_summary['model_size_mb']:.2f} MB")
+    print(f"   - 设备: {model_summary['device']}")
     
     # 训练模型
     training_result = trainer.train(
@@ -264,10 +382,10 @@ def train_single_model(
     )
     
     # 测试模型
-    print(f"\n🔍 测试 {cfg['model']['name']}...")
+    print(f"\n[TEST] 测试 {cfg['model']['name']}...")
     test_result = trainer.evaluate(test_loader, generate_plots=True)
     
-    # 保存结果
+    # 保存详细结果（保持向后兼容）
     results_path = trainer.save_dir / "results.json"
     with open(results_path, 'w', encoding='utf-8') as f:
         import json
@@ -281,9 +399,28 @@ def train_single_model(
             'model_summary': model_summary
         }, f, indent=2, ensure_ascii=False)
     
-    print(f"✅ {cfg['model']['name']} 训练完成!")
-    print(f"📊 测试AUC: {test_result['metrics']['auc']:.4f}")
-    print(f"📊 测试准确率: {test_result['metrics']['acc']:.4f}")
+    # 保存统一格式的指标摘要（供实验汇总脚本使用）
+    metrics_summary = {
+        'model_name': cfg["model"]["name"],
+        'best_val_auc': training_result.get('best_val_auc', None),
+        'best_epoch': training_result.get('best_epoch', None),
+        'total_time': training_result.get('total_time', None),
+        'final_val_auc': training_result.get('val_history', {}).get('auc', [None])[-1] if training_result.get('val_history', {}).get('auc') else None,
+        'final_val_acc': training_result.get('val_history', {}).get('acc', [None])[-1] if training_result.get('val_history', {}).get('acc') else None,
+        'final_val_f1': training_result.get('val_history', {}).get('f1', [None])[-1] if training_result.get('val_history', {}).get('f1') else None,
+        'test_auc': test_result['metrics'].get('auc', None),
+        'test_acc': test_result['metrics'].get('acc', None),
+        'test_f1': test_result['metrics'].get('f1', None),
+        'test_sensitivity@90%spec': test_result['metrics'].get('sensitivity@90%spec', None),
+    }
+    
+    metrics_summary_path = trainer.save_dir / "metrics_summary.json"
+    with open(metrics_summary_path, 'w', encoding='utf-8') as f:
+        json.dump(metrics_summary, f, indent=2, ensure_ascii=False)
+    
+    print(f"[OK] {cfg['model']['name']} 训练完成!")
+    print(f"[RESULT] 测试AUC: {test_result['metrics']['auc']:.4f}")
+    print(f"[RESULT] 测试准确率: {test_result['metrics']['acc']:.4f}")
     
     return trainer
 
@@ -335,7 +472,7 @@ def train_all_models(
             trainers.append(trainer)
             
         except Exception as e:
-            print(f"❌ 训练 {model_name} 失败: {e}")
+            print(f"[ERROR] 训练 {model_name} 失败: {e}")
             import traceback
             traceback.print_exc()
             continue
@@ -350,7 +487,7 @@ def train_all_models(
         )
         
         print(f"\n🏆 最佳模型: {comparison_result['best_model']}")
-        print(f"📊 最佳AUC: {comparison_result['best_auc']:.4f}")
+        print(f"[RESULT] 最佳AUC: {comparison_result['best_auc']:.4f}")
         
         # 保存比较结果
         comparison_path = Path(cfg["train"].get("save_dir", "results")) / "comparison" / "comparison_summary.json"
@@ -387,7 +524,7 @@ def main():
     
     if args.eval_only:
         # 仅评估模式
-        print(f"\n🔍 仅评估模式: {args.eval_only}")
+        print(f"\n[EVAL] 仅评估模式: {args.eval_only}")
         model = build_model(cfg, dataset_info['tab_dim'], dataset_info['spec_len'])
         trainer = EnhancedTrainer(
             model=model,
@@ -397,7 +534,7 @@ def main():
         )
         trainer.load_model()
         result = trainer.evaluate(test_loader)
-        print(f"📊 评估结果: {result['metrics']}")
+        print(f"[RESULT] 评估结果: {result['metrics']}")
         
     elif args.train_all:
         # 训练所有模型

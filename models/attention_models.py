@@ -223,9 +223,21 @@ class SpectraEncoder(nn.Module):
         Returns:
             dict with same structure as input
         """
+        # ===== Soft Gating for Missing Modality =====
+        emb = spectra_result["embedding"]
+        mask = spectra_result.get("mask", None)
+        if mask is not None:
+            m = mask.unsqueeze(-1).float()  # [B,1]
+            # 建立可学习的默认 embedding，用于模态缺失时补偿
+            if not hasattr(self, "_soft_gate_default"):
+                # 初始化为全部 0 → 不破坏已有 embedding 分布
+                self._soft_gate_default = nn.Parameter(torch.zeros_like(emb[0:1]))
+            # soft gating
+            emb = emb * m + (1 - m) * self._soft_gate_default
+
         return {
-            "embedding": spectra_result["embedding"],  # [B, emb_dim]
-            "logits": spectra_result["logits"]         # [B, num_classes]
+            "embedding": emb,                # [B, emb_dim]
+            "logits": spectra_result["logits"]  # [B, num_classes] 或 None
         }
 
 # PatientPooling 类已移除，因为现在只处理外部模型输出
@@ -250,9 +262,21 @@ class TabularEncoder(nn.Module):
         Returns:
             dict with same structure as input
         """
+        # ===== Soft Gating for Missing Modality =====
+        emb = tabular_result["embedding"]
+        mask = tabular_result.get("mask", None)
+        if mask is not None:
+            m = mask.unsqueeze(-1).float()  # [B,1]
+            # 建立可学习的默认 embedding，用于模态缺失时补偿
+            if not hasattr(self, "_soft_gate_default"):
+                # 初始化为全部 0 → 不破坏已有 embedding 分布
+                self._soft_gate_default = nn.Parameter(torch.zeros_like(emb[0:1]))
+            # soft gating
+            emb = emb * m + (1 - m) * self._soft_gate_default
+
         return {
-            "embedding": tabular_result["embedding"],  # [B, emb_dim]
-            "logits": tabular_result["logits"]         # [B, num_classes]
+            "embedding": emb,                 # [B, emb_dim]
+            "logits": tabular_result["logits"]  # [B, num_classes] 或 None
         }
 
 class EnhancedCrossAttentionFusion(nn.Module):
@@ -400,10 +424,8 @@ class EnhancedClassifier(nn.Module):
         
         self.classifier = nn.Sequential(*layers)
         
-        # 残差连接（如果输入维度与第一个隐藏层维度相同）
+        # 残差连接标志（仅在输入维度与第一个隐藏层维度相同且结构简单时考虑）
         self.use_residual = (in_dim == hidden_dims[0])
-        if self.use_residual:
-            self.residual_proj = nn.Linear(in_dim, hidden_dims[0])
 
     def forward(self, x):
         """
@@ -422,11 +444,9 @@ class EnhancedClassifier(nn.Module):
             # 通过前几层
             x = self.classifier[:-4](x)  # 除了最后4层（Linear, LayerNorm, ReLU, Dropout）
             
-            # 残差连接
+            # 残差连接（仅在维度完全匹配时启用）
             if residual.shape[-1] == x.shape[-1]:
                 x = x + residual
-            else:
-                x = x + self.residual_proj(residual)
             
             # 通过剩余层
             x = self.classifier[-4:](x)
@@ -514,6 +534,16 @@ class EnhancedAttentionMultimodal(nn.Module):
         tab_embedding = tab_result["embedding"]    # [B, emb_dim]
         spec_logits = spec_result["logits"]
         tab_logits = tab_result["logits"]
+        
+        # ===== Learnable Modality Fusion Gate =====
+        if not hasattr(self, "fusion_gate"):
+            # 两个模态各一个权重，初始化为均等
+            self.fusion_gate = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
+        # 归一化权重
+        gate = torch.softmax(self.fusion_gate, dim=0)
+        # 加权模态 embedding
+        spec_embedding = spec_embedding * gate[0]
+        tab_embedding = tab_embedding * gate[1]
         
         # 融合两个模态的特征
         if self.fusion_type == 'enhanced_cross':

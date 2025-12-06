@@ -153,7 +153,18 @@ class CrossModalAttention(nn.Module):
         tab_attended = self.norm2(tab_attended + tab_proj)  # Residual connection
         tab_attended = self.norm2(tab_attended + self.ffn2(tab_attended))  # FFN + residual
         
-        return spec_attended.squeeze(1), tab_attended.squeeze(1)  # [B, d_model]
+        # 确保输出是 [B, d_model] 格式
+        if len(spec_attended.shape) == 3:
+            spec_attended = spec_attended.squeeze(1)  # [B, 1, d_model] -> [B, d_model]
+        elif len(spec_attended.shape) != 2:
+            spec_attended = spec_attended.view(spec_attended.shape[0], -1)
+        
+        if len(tab_attended.shape) == 3:
+            tab_attended = tab_attended.squeeze(1)  # [B, 1, d_model] -> [B, d_model]
+        elif len(tab_attended.shape) != 2:
+            tab_attended = tab_attended.view(tab_attended.shape[0], -1)
+        
+        return spec_attended, tab_attended  # [B, d_model]
 
 
 # ----------------------------
@@ -219,13 +230,21 @@ class TFTMultimodal(nn.Module):
         self.enhanced_gating = EnhancedGating(spec_emb, tab_emb, d_model=fusion_dim)
         
         # Multi-level fusion
+        # 第一个层：输入是 [B, fusion_dim * 2]，输出是 [B, fusion_dim]
+        # 第二个层：输入是 [B, fusion_dim]，输出是 [B, fusion_dim]
         self.fusion_layers = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(fusion_dim * 2, fusion_dim),
                 nn.LayerNorm(fusion_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout)
-            ) for _ in range(2)
+            ),
+            nn.Sequential(
+                nn.Linear(fusion_dim, fusion_dim),
+                nn.LayerNorm(fusion_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
         ])
         
         # Enhanced classifier with auxiliary outputs
@@ -260,32 +279,162 @@ class TFTMultimodal(nn.Module):
         self.scan_attention = nn.MultiheadAttention(spec_emb, num_heads=8, dropout=dropout, batch_first=True)
         self.scan_query = nn.Parameter(torch.randn(1, 1, spec_emb))
 
-    def forward(self, spectra, mask, tabular):
-        # spectra: [B, S, L], mask: [B, S], tabular: [B, D]
-        B, S, L = spectra.shape
+    def forward(self, *args):
+        """
+        支持两种调用方式的前向传播
         
-        # Enhanced spectral encoding
-        spec_emb_per_scan = self.spec_encoder(spectra)  # [B, S, D_spec]
+        Args:
+            方式1: spectra, mask, tabular (原始张量格式)
+            方式2: spectra_result, tabular_result (字典格式，embedding 模式)
+        """
+        if len(args) == 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
+            # Embedding 模式：字典格式输入
+            spectra_result, tabular_result = args
+            
+            # ===== Soft Gating for Missing Modality =====
+            spec_vec = spectra_result['embedding']
+            spec_mask = spectra_result.get('mask', None)
+            if spec_mask is not None:
+                m = spec_mask.unsqueeze(-1).float()  # [B,1]
+                # 建立可学习的默认 embedding，用于模态缺失时补偿
+                if not hasattr(self, "_soft_gate_default_spec"):
+                    self._soft_gate_default_spec = nn.Parameter(torch.zeros_like(spec_vec[0:1]))
+                # soft gating
+                spec_vec = spec_vec * m + (1 - m) * self._soft_gate_default_spec
+            
+            tab_emb = tabular_result['embedding']
+            tab_mask = tabular_result.get('mask', None)
+            if tab_mask is not None:
+                m = tab_mask.unsqueeze(-1).float()  # [B,1]
+                # 建立可学习的默认 embedding，用于模态缺失时补偿
+                if not hasattr(self, "_soft_gate_default_tab"):
+                    self._soft_gate_default_tab = nn.Parameter(torch.zeros_like(tab_emb[0:1]))
+                # soft gating
+                tab_emb = tab_emb * m + (1 - m) * self._soft_gate_default_tab
+            
+            # ===== 动态投影：将实际的 embedding 维度投影到模型期望的维度 =====
+            actual_spec_dim = spec_vec.shape[-1]
+            actual_tab_dim = tab_emb.shape[-1]
+            expected_spec_dim = self.cross_attention.spec_proj.in_features
+            expected_tab_dim = self.cross_attention.tab_proj.in_features
+            
+            # 保存投影前的 embedding，用于 aux_classifier
+            spec_vec_orig = spec_vec
+            tab_emb_orig = tab_emb
+            
+            # 如果实际维度与模型期望维度不同，添加投影层
+            if actual_spec_dim != expected_spec_dim:
+                if not hasattr(self, "_embedding_proj_spec"):
+                    self._embedding_proj_spec = nn.Linear(actual_spec_dim, expected_spec_dim)
+                    # 确保投影层被注册为模型参数并移动到正确的设备
+                    self._embedding_proj_spec = self._embedding_proj_spec.to(spec_vec.device)
+                    # 注册为子模块，确保参数被包含在模型中
+                    self.add_module("_embedding_proj_spec", self._embedding_proj_spec)
+                spec_vec = self._embedding_proj_spec(spec_vec)
+            
+            if actual_tab_dim != expected_tab_dim:
+                if not hasattr(self, "_embedding_proj_tab"):
+                    self._embedding_proj_tab = nn.Linear(actual_tab_dim, expected_tab_dim)
+                    # 确保投影层被注册为模型参数并移动到正确的设备
+                    self._embedding_proj_tab = self._embedding_proj_tab.to(tab_emb.device)
+                    # 注册为子模块，确保参数被包含在模型中
+                    self.add_module("_embedding_proj_tab", self._embedding_proj_tab)
+                tab_emb = self._embedding_proj_tab(tab_emb)
+            
+            spec_logits = spectra_result.get('logits', None)
+            tab_logits = tabular_result.get('logits', None)
+            
+        elif len(args) == 3:
+            # Raw 模式：处理原始张量输入
+            spectra, mask, tabular = args
+            B, S, L = spectra.shape
+
+            # Enhanced spectral encoding
+            spec_emb_per_scan = self.spec_encoder(spectra)  # [B, S, D_spec]
+
+            # Attention-based scan pooling with mask（raw 模式下使用扫描级 mask）
+            scan_query = self.scan_query.expand(B, -1, -1)  # [B, 1, D_spec]
+            if mask is not None:
+                mask_expanded = mask.unsqueeze(1)  # [B, 1, S]
+                spec_vec, _ = self.scan_attention(
+                    scan_query, spec_emb_per_scan, spec_emb_per_scan,
+                    key_padding_mask=~mask
+                )  # [B, 1, D_spec]
+            else:
+                # 当没有提供序列 mask（例如将 embedding 直接输入时），退化为简单平均
+                spec_vec = spec_emb_per_scan.mean(dim=1, keepdim=True)  # [B, 1, D_spec]
+            spec_vec = spec_vec.squeeze(1)  # [B, D_spec]
+
+            # Enhanced tabular encoding
+            tab_emb = self.tab_encoder(tabular)  # [B, D_tab]
+            
+            spec_logits = None
+            tab_logits = None
+        else:
+            raise ValueError(f"[ERROR] 不支持的参数数量: {len(args)}")
         
-        # Attention-based scan pooling with mask
-        scan_query = self.scan_query.expand(B, -1, -1)  # [B, 1, D_spec]
-        # Apply mask to attention
-        mask_expanded = mask.unsqueeze(1)  # [B, 1, S]
-        spec_vec, _ = self.scan_attention(scan_query, spec_emb_per_scan, spec_emb_per_scan, 
-                                        key_padding_mask=~mask)  # [B, 1, D_spec]
-        spec_vec = spec_vec.squeeze(1)  # [B, D_spec]
+        # ===== Learnable Modality Fusion Gate =====
+        if not hasattr(self, "fusion_gate"):
+            # 两个模态各一个权重，初始化为均等
+            self.fusion_gate = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
+        # 归一化权重
+        gate = torch.softmax(self.fusion_gate, dim=0)
+        # 加权模态 embedding
+        spec_vec = spec_vec * gate[0]
+        tab_emb = tab_emb * gate[1]
         
-        # Enhanced tabular encoding
-        tab_emb = self.tab_encoder(tabular)  # [B, D_tab]
+        # 确保维度匹配：在调用 cross_attention 之前再次检查并应用投影
+        # 这确保即使投影层在 Fusion Gate 之后，维度也是正确的
+        if spec_vec.shape[-1] != self.cross_attention.spec_proj.in_features:
+            if not hasattr(self, "_embedding_proj_spec"):
+                self._embedding_proj_spec = nn.Linear(spec_vec.shape[-1], self.cross_attention.spec_proj.in_features)
+                self._embedding_proj_spec = self._embedding_proj_spec.to(spec_vec.device)
+                self.add_module("_embedding_proj_spec", self._embedding_proj_spec)
+            spec_vec = self._embedding_proj_spec(spec_vec)
+        if tab_emb.shape[-1] != self.cross_attention.tab_proj.in_features:
+            if not hasattr(self, "_embedding_proj_tab"):
+                self._embedding_proj_tab = nn.Linear(tab_emb.shape[-1], self.cross_attention.tab_proj.in_features)
+                self._embedding_proj_tab = self._embedding_proj_tab.to(tab_emb.device)
+                self.add_module("_embedding_proj_tab", self._embedding_proj_tab)
+            tab_emb = self._embedding_proj_tab(tab_emb)
         
         # Cross-modal attention
         spec_attended, tab_attended = self.cross_attention(spec_vec, tab_emb)  # [B, fusion_dim]
+        
+        # 确保输出维度正确（处理可能的维度问题）
+        if len(spec_attended.shape) > 2:
+            spec_attended = spec_attended.squeeze(1)  # 确保是 [B, d_model]
+        if len(tab_attended.shape) > 2:
+            tab_attended = tab_attended.squeeze(1)  # 确保是 [B, d_model]
+        
+        # 验证输出维度
+        expected_dim = self.cross_attention.spec_proj.out_features
+        if spec_attended.shape[-1] != expected_dim:
+            raise RuntimeError(f"spec_attended 维度错误: {spec_attended.shape}，期望最后一维: {expected_dim}")
+        if tab_attended.shape[-1] != expected_dim:
+            raise RuntimeError(f"tab_attended 维度错误: {tab_attended.shape}，期望最后一维: {expected_dim}")
         
         # Enhanced gating
         gated_spec = self.enhanced_gating(spec_vec, tab_emb)  # [B, D_spec]
         
         # Multi-level fusion
+        # 确保 spec_attended 和 tab_attended 都是 2D 张量 [B, d_model]
+        if len(spec_attended.shape) != 2:
+            spec_attended = spec_attended.view(spec_attended.shape[0], -1)
+        if len(tab_attended.shape) != 2:
+            tab_attended = tab_attended.view(tab_attended.shape[0], -1)
+        
+        # 验证维度匹配
+        if spec_attended.shape[0] != tab_attended.shape[0]:
+            raise RuntimeError(f"Batch size 不匹配: spec_attended.shape={spec_attended.shape}, tab_attended.shape={tab_attended.shape}")
+        
         fusion_input = torch.cat([spec_attended, tab_attended], dim=-1)  # [B, fusion_dim * 2]
+        # 验证融合输入维度
+        expected_fusion_dim = expected_dim * 2
+        if fusion_input.shape[-1] != expected_fusion_dim:
+            raise RuntimeError(f"fusion_input 维度错误: {fusion_input.shape}，期望最后一维: {expected_fusion_dim}, "
+                             f"spec_attended.shape={spec_attended.shape}, tab_attended.shape={tab_attended.shape}, "
+                             f"expected_dim={expected_dim}")
         fused_features = fusion_input
         
         for fusion_layer in self.fusion_layers:
@@ -295,8 +444,36 @@ class TFTMultimodal(nn.Module):
         logits = self.classifier(fused_features)  # [B, num_classes]
         
         # Auxiliary predictions for intermediate supervision
-        aux_logits_spec = self.aux_classifier_spec(spec_vec)  # [B, num_classes]
-        aux_logits_tab = self.aux_classifier_tab(tab_emb)     # [B, num_classes]
+        # 在 embedding 模式下，使用投影前的原始 embedding
+        if len(args) == 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
+            # Embedding 模式：使用原始维度
+            aux_spec_input = spec_vec_orig if 'spec_vec_orig' in locals() else spec_vec
+            aux_tab_input = tab_emb_orig if 'tab_emb_orig' in locals() else tab_emb
+        else:
+            # Raw 模式：使用当前维度
+            aux_spec_input = spec_vec
+            aux_tab_input = tab_emb
+        
+        # 确保 aux_classifier 的输入维度正确
+        if aux_spec_input.shape[-1] == self.aux_classifier_spec[0].in_features:
+            aux_logits_spec = self.aux_classifier_spec(aux_spec_input)  # [B, num_classes]
+        else:
+            # 如果维度不匹配，创建动态投影层
+            if not hasattr(self, "_aux_proj_spec"):
+                self._aux_proj_spec = nn.Linear(aux_spec_input.shape[-1], self.aux_classifier_spec[0].in_features)
+                self._aux_proj_spec = self._aux_proj_spec.to(aux_spec_input.device)
+                self.add_module("_aux_proj_spec", self._aux_proj_spec)
+            aux_logits_spec = self.aux_classifier_spec(self._aux_proj_spec(aux_spec_input))
+        
+        if aux_tab_input.shape[-1] == self.aux_classifier_tab[0].in_features:
+            aux_logits_tab = self.aux_classifier_tab(aux_tab_input)     # [B, num_classes]
+        else:
+            # 如果维度不匹配，创建动态投影层
+            if not hasattr(self, "_aux_proj_tab"):
+                self._aux_proj_tab = nn.Linear(aux_tab_input.shape[-1], self.aux_classifier_tab[0].in_features)
+                self._aux_proj_tab = self._aux_proj_tab.to(aux_tab_input.device)
+                self.add_module("_aux_proj_tab", self._aux_proj_tab)
+            aux_logits_tab = self.aux_classifier_tab(self._aux_proj_tab(aux_tab_input))
         
         return {
             "embedding": fused_features,        # final fused embedding

@@ -1,0 +1,13 @@
+{
+  "model_name": "BaselineMultimodal",
+  "best_val_auc": 0.7142857142857144,
+  "best_epoch": 8,
+  "total_time": 1.0595993995666504,
+  "final_val_auc": 0.5714285714285714,
+  "final_val_acc": 0.2,
+  "final_val_f1": 0.2333333333333333,
+  "test_auc": 0.5357142857142857,
+  "test_acc": 0.45454545454545453,
+  "test_f1": 0.4502164502164501,
+  "test_sensitivity@90%spec": 0.0
+}

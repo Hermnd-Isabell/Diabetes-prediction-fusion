@@ -63,7 +63,8 @@ class EnhancedTrainer:
         weight_decay: float = 1e-4,
         save_dir: str = "results",
         enable_visualization: bool = True,
-        enable_interpretability: bool = True
+        enable_interpretability: bool = True,
+        use_embedding_input: bool = False,
     ):
         """
         初始化增强版训练器
@@ -83,6 +84,9 @@ class EnhancedTrainer:
         self.device = device
         self.save_dir = Path(save_dir) / model_name
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 输入模式设置：原始序列输入 or 直接 embedding 输入
+        self.use_embedding_input = use_embedding_input
         
         # 训练设置
         self.criterion = nn.CrossEntropyLoss()
@@ -111,12 +115,16 @@ class EnhancedTrainer:
         self.best_val_auc = 0.0
         self.best_model_state = None
         
-        print(f"🚀 增强版训练器初始化完成")
-        print(f"📊 模型: {model_name}")
-        print(f"💻 设备: {device}")
-        print(f"💾 保存目录: {self.save_dir}")
-        print(f"📈 可视化: {'启用' if enable_visualization else '禁用'}")
-        print(f"🔍 可解释性: {'启用' if enable_interpretability else '禁用'}")
+        # 模态权重历史记录（用于可视化）
+        self.modality_gate_history = []
+        
+        print(f"[INIT] 增强版训练器初始化完成")
+        print(f"[MODEL] 模型: {model_name}")
+        print(f"[DEVICE] 设备: {device}")
+        print(f"[SAVE] 保存目录: {self.save_dir}")
+        print(f"[VIS] 可视化: {'启用' if enable_visualization else '禁用'}")
+        print(f"[INTERP] 可解释性: {'启用' if enable_interpretability else '禁用'}")
+        print(f"[MODE] 输入模式: {'embedding' if self.use_embedding_input else 'raw 序列'}")
     
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
         """训练一个epoch"""
@@ -127,18 +135,45 @@ class EnhancedTrainer:
         all_probs = []
         
         pbar = tqdm(train_loader, desc=f"训练 {self.model_name}")
-        for batch in pbar:
+        for step, batch in enumerate(pbar):
             # 数据准备
             spectra = batch["spectra"].to(self.device)
             mask = batch.get("mask", None)
-            if mask is not None:
+            if not self.use_embedding_input and mask is not None:
                 mask = mask.to(self.device)
             tabular = batch["tabular"].to(self.device)
             labels = batch["label"].to(self.device)
+            has_spectra = batch.get("has_spectra", None)
+            has_tabular = batch.get("has_tabular", None)
+            if has_spectra is not None:
+                has_spectra = has_spectra.to(self.device)
+            if has_tabular is not None:
+                has_tabular = has_tabular.to(self.device)
             
             # 前向传播
             self.optimizer.zero_grad()
-            outputs = self.model(spectra, mask, tabular)
+            if not self.use_embedding_input:
+                # raw 模式：保持原有调用方式
+                outputs = self.model(spectra, mask, tabular)
+            else:
+                # embedding 模式：包装为外部模型输出字典，并携带缺模态 mask
+                if step == 0:
+                    print("[INFO] 当前使用 embedding 输入模式：model(spectra_dict, tabular_dict)")
+                    if has_spectra is not None and has_tabular is not None:
+                        ratio_spec = has_spectra.float().mean().item()
+                        ratio_tab = has_tabular.float().mean().item()
+                        print(f"[INFO] embedding 模式：本 batch 中有光谱的比例={ratio_spec:.2f}, 有临床的比例={ratio_tab:.2f}")
+                spectra_result = {
+                    "embedding": spectra,
+                    "mask": has_spectra,
+                    "logits": None,
+                }
+                tabular_result = {
+                    "embedding": tabular,
+                    "mask": has_tabular,
+                    "logits": None,
+                }
+                outputs = self.model(spectra_result, tabular_result)
             logits = outputs["logits"]
             loss = self.criterion(logits, labels)
             
@@ -183,13 +218,34 @@ class EnhancedTrainer:
                 # 数据准备
                 spectra = batch["spectra"].to(self.device)
                 mask = batch.get("mask", None)
-                if mask is not None:
+                if not self.use_embedding_input and mask is not None:
                     mask = mask.to(self.device)
                 tabular = batch["tabular"].to(self.device)
                 labels = batch["label"].to(self.device)
+                has_spectra = batch.get("has_spectra", None)
+                has_tabular = batch.get("has_tabular", None)
+                if has_spectra is not None:
+                    has_spectra = has_spectra.to(self.device)
+                if has_tabular is not None:
+                    has_tabular = has_tabular.to(self.device)
                 
                 # 前向传播
-                outputs = self.model(spectra, mask, tabular)
+                if not self.use_embedding_input:
+                    # raw 模式：保持原有调用方式
+                    outputs = self.model(spectra, mask, tabular)
+                else:
+                    # embedding 模式：包装为外部模型输出字典，并携带缺模态 mask
+                    spectra_result = {
+                        "embedding": spectra,
+                        "mask": has_spectra,
+                        "logits": None,
+                    }
+                    tabular_result = {
+                        "embedding": tabular,
+                        "mask": has_tabular,
+                        "logits": None,
+                    }
+                    outputs = self.model(spectra_result, tabular_result)
                 logits = outputs["logits"]
                 loss = self.criterion(logits, labels)
                 
@@ -218,26 +274,72 @@ class EnhancedTrainer:
         
         return metrics
     
+    def _log_modality_gates(self, epoch: int):
+        """
+        尝试从模型中提取 fusion_gate（或子模块中的 fusion_gate），
+        记录 softmax 后的两模态权重。
+        """
+        gate_tensor = None
+        
+        # 常见情况 1：模型本身有 fusion_gate（AttentionMultimodal, EnhancedMMTMFusion）
+        if hasattr(self.model, "fusion_gate"):
+            gate_tensor = self.model.fusion_gate
+        
+        # 常见情况 2：BaselineMultimodal 内部的 fusion 模块上有 fusion_gate
+        elif hasattr(self.model, "fusion") and hasattr(self.model.fusion, "fusion_gate"):
+            gate_tensor = self.model.fusion.fusion_gate
+        
+        if gate_tensor is None:
+            return  # 当前模型没有 fusion_gate，直接跳过
+        
+        with torch.no_grad():
+            gate = torch.nn.functional.softmax(gate_tensor.detach().cpu().float(), dim=0)  # [2]
+        
+        record = {
+            "epoch": int(epoch),
+            "gate_raw": gate_tensor.detach().cpu().tolist(),
+            "gate_softmax": gate.tolist(),  # [w_spectra, w_clinical]
+        }
+        self.modality_gate_history.append(record)
+    
     def _calculate_metrics(self, y_true: List, y_prob: List, y_pred: List) -> Dict[str, float]:
         """计算评估指标"""
         y_true = np.array(y_true)
         y_prob = np.array(y_prob)
         y_pred = np.array(y_pred)
-        
-        try:
-            auc = roc_auc_score(y_true, y_prob)
-        except ValueError:
-            auc = 0.5
-        
+
+        # 统一二分类 / 多分类的评估逻辑
+        classes = np.unique(y_true)
+        num_classes = len(classes)
+
+        # 准确率 & 加权 F1（sklearn 已支持多分类）
         acc = accuracy_score(y_true, y_pred)
         f1 = f1_score(y_true, y_pred, average='weighted')
-        
-        # 计算敏感性@90%特异性
-        fpr, tpr, _ = roc_curve(y_true, y_prob)
-        specificity = 1 - fpr
-        mask = specificity >= 0.9
-        sens_at_90 = tpr[mask].max() if np.any(mask) else np.nan
-        
+
+        # 对于 AUC 和 sensitivity@90%spec：
+        # - 二分类：直接使用原始标签和正类概率
+        # - 多分类：退化为某一类（默认 label=1，如无则使用最大标签）的 one-vs-rest 指标，
+        #   避免 sklearn 在多分类上抛出 "multiclass format is not supported" 错误。
+        if num_classes <= 2:
+            y_binary = y_true
+        else:
+            # 选择一个“疾病”相关的正类：优先使用标签 1，否则使用最大标签
+            pos_label = 1 if 1 in classes else classes.max()
+            y_binary = (y_true == pos_label).astype(int)
+
+        try:
+            auc = roc_auc_score(y_binary, y_prob)
+        except ValueError:
+            auc = np.nan
+
+        try:
+            fpr, tpr, _ = roc_curve(y_binary, y_prob)
+            specificity = 1 - fpr
+            mask = specificity >= 0.9
+            sens_at_90 = tpr[mask].max() if np.any(mask) else np.nan
+        except ValueError:
+            sens_at_90 = np.nan
+
         return {
             'acc': acc,
             'auc': auc,
@@ -266,10 +368,10 @@ class EnhancedTrainer:
         Returns:
             训练结果字典
         """
-        print(f"\n🚀 开始训练 {self.model_name}")
-        print(f"📊 训练样本: {len(train_loader.dataset)}")
-        print(f"📊 验证样本: {len(val_loader.dataset)}")
-        print(f"🔄 训练轮数: {epochs}")
+        print(f"\n[TRAIN] 开始训练 {self.model_name}")
+        print(f"[DATA] 训练样本: {len(train_loader.dataset)}")
+        print(f"[DATA] 验证样本: {len(val_loader.dataset)}")
+        print(f"[EPOCH] 训练轮数: {epochs}")
         print("=" * 60)
         
         start_time = time.time()
@@ -294,6 +396,9 @@ class EnhancedTrainer:
                 if key in val_metrics:
                     self.val_history[key].append(val_metrics[key])
             
+            # 记录模态权重（如果模型有 fusion_gate）
+            self._log_modality_gates(epoch)
+            
             # 保存最佳模型
             if val_metrics['auc'] > self.best_val_auc:
                 self.best_val_auc = val_metrics['auc']
@@ -317,14 +422,14 @@ class EnhancedTrainer:
             
             # 早停检查
             if patience_counter >= early_stopping_patience:
-                print(f"🛑 早停触发 (patience={early_stopping_patience})")
+                print(f"[STOP] 早停触发 (patience={early_stopping_patience})")
                 break
         
         # 训练完成
         total_time = time.time() - start_time
-        print(f"\n✅ 训练完成!")
-        print(f"⏱️  总时间: {total_time:.1f}s")
-        print(f"🏆 最佳验证AUC: {self.best_val_auc:.4f} (Epoch {best_epoch+1})")
+        print(f"\n[OK] 训练完成!")
+        print(f"[TIME] 总时间: {total_time:.1f}s")
+        print(f"[BEST] 最佳验证AUC: {self.best_val_auc:.4f} (Epoch {best_epoch+1})")
         
         # 保存最佳模型
         if save_best and self.best_model_state is not None:
@@ -334,6 +439,13 @@ class EnhancedTrainer:
         # 生成可视化
         if self.enable_visualization:
             self._generate_training_visualizations()
+        
+        # 保存模态权重历史到 JSON
+        if self.modality_gate_history:
+            gate_path = self.save_dir / "modality_gate_history.json"
+            with gate_path.open("w", encoding="utf-8") as f:
+                json.dump(self.modality_gate_history, f, ensure_ascii=False, indent=2)
+            print(f"[SAVE] 模态权重轨迹已保存到: {gate_path}")
         
         return {
             'best_val_auc': self.best_val_auc,
@@ -358,7 +470,7 @@ class EnhancedTrainer:
         Returns:
             评估结果字典
         """
-        print(f"\n🔍 评估 {self.model_name}")
+        print(f"\n[EVAL] 评估 {self.model_name}")
         print("=" * 40)
         
         self.model.eval()
@@ -372,14 +484,38 @@ class EnhancedTrainer:
             for batch in tqdm(test_loader, desc="评估"):
                 # 数据准备
                 spectra = batch["spectra"].to(self.device)
-                mask = batch.get("mask", None)
-                if mask is not None:
-                    mask = mask.to(self.device)
                 tabular = batch["tabular"].to(self.device)
                 labels = batch["label"].to(self.device)
+
+                has_spectra = batch.get("has_spectra", None)
+                has_tabular = batch.get("has_tabular", None)
+                if has_spectra is not None:
+                    has_spectra = has_spectra.to(self.device)
+                if has_tabular is not None:
+                    has_tabular = has_tabular.to(self.device)
+
+                mask = batch.get("mask", None)
+                if not self.use_embedding_input and mask is not None:
+                    mask = mask.to(self.device)
                 
                 # 前向传播
-                outputs = self.model(spectra, mask, tabular)
+                if not self.use_embedding_input:
+                    # raw 模式：保持原有调用方式
+                    outputs = self.model(spectra, mask, tabular)
+                else:
+                    # embedding 模式：包装为外部模型输出字典，并携带缺模态 mask
+                    spectra_result = {
+                        "embedding": spectra,
+                        "mask": has_spectra,
+                        "logits": None,
+                    }
+                    tabular_result = {
+                        "embedding": tabular,
+                        "mask": has_tabular,
+                        "logits": None,
+                    }
+                    outputs = self.model(spectra_result, tabular_result)
+
                 logits = outputs["logits"]
                 probs = torch.softmax(logits, dim=1)
                 preds = torch.argmax(logits, dim=1)
@@ -387,7 +523,9 @@ class EnhancedTrainer:
                 # 收集结果
                 all_preds.extend(preds.detach().cpu().numpy())
                 all_labels.extend(labels.detach().cpu().numpy())
-                all_probs.extend(probs[:, 1].detach().cpu().numpy())
+                # 使用第 1 类的概率作为“正类”概率（多分类情况下在 _calculate_metrics 里会做 one-vs-rest 处理）
+                pos_prob = probs[:, 1] if probs.shape[1] > 1 else probs[:, 0]
+                all_probs.extend(pos_prob.detach().cpu().numpy())
                 
                 # 收集特征和注意力权重
                 if 'embedding' in outputs:
@@ -398,18 +536,27 @@ class EnhancedTrainer:
         # 计算指标
         metrics = self._calculate_metrics(all_labels, all_probs, all_preds)
         
-        # 生成详细报告
+        # 生成详细报告（兼容多分类情况）
+        unique_labels = sorted(np.unique(all_labels))
+        # 如果是二分类并且标签是 {0,1}，使用更友好的名称；否则使用字符串化的标签
+        if len(unique_labels) == 2 and set(unique_labels) == {0, 1}:
+            target_names = ['Control', 'DM']
+        else:
+            target_names = [str(l) for l in unique_labels]
+
         report = classification_report(
-            all_labels, all_preds,
-            target_names=['Control', 'DM'],
+            all_labels,
+            all_preds,
+            labels=unique_labels,
+            target_names=target_names,
             output_dict=True
         )
         
-        print(f"📊 测试结果:")
-        print(f"   • 准确率: {metrics['acc']:.4f}")
-        print(f"   • AUC: {metrics['auc']:.4f}")
-        print(f"   • F1分数: {metrics['f1']:.4f}")
-        print(f"   • 敏感性@90%特异性: {metrics['sensitivity@90%spec']:.4f}")
+        print(f"[RESULT] 测试结果:")
+        print(f"   - 准确率: {metrics['acc']:.4f}")
+        print(f"   - AUC: {metrics['auc']:.4f}")
+        print(f"   - F1分数: {metrics['f1']:.4f}")
+        print(f"   - 敏感性@90%特异性: {metrics['sensitivity@90%spec']:.4f}")
         
         # 生成可视化
         if generate_plots and self.enable_visualization:
@@ -446,7 +593,7 @@ class EnhancedTrainer:
     
     def _generate_training_visualizations(self):
         """生成训练过程可视化"""
-        print("📊 生成训练可视化...")
+        print("[VIS] 生成训练可视化...")
         
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
         fig.suptitle(f'{self.model_name} - 训练过程', fontsize=16, fontweight='bold')
@@ -491,7 +638,7 @@ class EnhancedTrainer:
         plt.savefig(self.save_dir / 'training_curves.png', dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"✅ 训练可视化已保存: {self.save_dir / 'training_curves.png'}")
+        print(f"[OK] 训练可视化已保存: {self.save_dir / 'training_curves.png'}")
     
     def _generate_evaluation_plots(
         self,
@@ -502,44 +649,68 @@ class EnhancedTrainer:
         attention_weights: Optional[np.ndarray] = None
     ):
         """生成评估图表"""
-        print("📊 生成评估可视化...")
+        print("[VIS] 生成评估可视化...")
         
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
         fig.suptitle(f'{self.model_name} - 模型评估', fontsize=16, fontweight='bold')
         
-        # ROC曲线
-        fpr, tpr, _ = roc_curve(y_true, y_prob)
-        auc = roc_auc_score(y_true, y_prob)
-        axes[0, 0].plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC曲线 (AUC = {auc:.3f})')
-        axes[0, 0].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', alpha=0.5)
-        axes[0, 0].set_xlim([0.0, 1.0])
-        axes[0, 0].set_ylim([0.0, 1.05])
-        axes[0, 0].set_xlabel('假正率 (FPR)')
-        axes[0, 0].set_ylabel('真正率 (TPR)')
-        axes[0, 0].set_title('ROC曲线')
-        axes[0, 0].legend(loc="lower right")
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # 精确率-召回率曲线
-        precision, recall, _ = precision_recall_curve(y_true, y_prob)
-        axes[0, 1].plot(recall, precision, color='blue', lw=2)
-        axes[0, 1].set_xlabel('召回率')
-        axes[0, 1].set_ylabel('精确率')
-        axes[0, 1].set_title('精确率-召回率曲线')
-        axes[0, 1].grid(True, alpha=0.3)
+        # ROC曲线 & 精确率-召回率曲线（兼容多分类：使用 one-vs-rest 视角）
+        y_true_arr = np.array(y_true)
+        classes = np.unique(y_true_arr)
+        num_classes = len(classes)
+
+        if num_classes <= 2:
+            y_binary = y_true_arr
+        else:
+            pos_label = 1 if 1 in classes else classes.max()
+            y_binary = (y_true_arr == pos_label).astype(int)
+
+        try:
+            fpr, tpr, _ = roc_curve(y_binary, y_prob)
+            auc = roc_auc_score(y_binary, y_prob)
+            axes[0, 0].plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC曲线 (AUC = {auc:.3f})')
+            axes[0, 0].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', alpha=0.5)
+            axes[0, 0].set_xlim([0.0, 1.0])
+            axes[0, 0].set_ylim([0.0, 1.05])
+            axes[0, 0].set_xlabel('假正率 (FPR)')
+            axes[0, 0].set_ylabel('真正率 (TPR)')
+            axes[0, 0].set_title('ROC曲线')
+            axes[0, 0].legend(loc="lower right")
+            axes[0, 0].grid(True, alpha=0.3)
+        except ValueError as e:
+            axes[0, 0].text(0.5, 0.5, f'ROC 计算失败:\n{e}', ha='center', va='center', transform=axes[0, 0].transAxes)
+            axes[0, 0].set_title('ROC曲线 (失败)')
+
+        try:
+            precision, recall, _ = precision_recall_curve(y_binary, y_prob)
+            axes[0, 1].plot(recall, precision, color='blue', lw=2)
+            axes[0, 1].set_xlabel('召回率')
+            axes[0, 1].set_ylabel('精确率')
+            axes[0, 1].set_title('精确率-召回率曲线')
+            axes[0, 1].grid(True, alpha=0.3)
+        except ValueError as e:
+            axes[0, 1].text(0.5, 0.5, f'PR 计算失败:\n{e}', ha='center', va='center', transform=axes[0, 1].transAxes)
+            axes[0, 1].set_title('精确率-召回率曲线 (失败)')
         
         # 混淆矩阵
-        cm = confusion_matrix(y_true, y_pred)
+        cm = confusion_matrix(y_true_arr, y_pred)
+        # 动态标签名称
+        unique_labels = sorted(np.unique(y_true_arr))
+        if len(unique_labels) == 2 and set(unique_labels) == {0, 1}:
+            xticklabels = yticklabels = ['Control', 'DM']
+        else:
+            xticklabels = yticklabels = [str(l) for l in unique_labels]
+
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0, 2],
-                   xticklabels=['Control', 'DM'], yticklabels=['Control', 'DM'])
+                    xticklabels=xticklabels, yticklabels=yticklabels)
         axes[0, 2].set_title('混淆矩阵')
         axes[0, 2].set_xlabel('预测标签')
         axes[0, 2].set_ylabel('真实标签')
         
         # 预测概率分布
-        axes[1, 0].hist([y_prob[i] for i in range(len(y_prob)) if y_true[i] == 0],
+        axes[1, 0].hist([y_prob[i] for i in range(len(y_prob)) if y_binary[i] == 0],
                        bins=20, alpha=0.7, label='Control', color='blue')
-        axes[1, 0].hist([y_prob[i] for i in range(len(y_prob)) if y_true[i] == 1],
+        axes[1, 0].hist([y_prob[i] for i in range(len(y_prob)) if y_binary[i] == 1],
                        bins=20, alpha=0.7, label='DM', color='red')
         axes[1, 0].set_xlabel('预测概率')
         axes[1, 0].set_ylabel('频次')
@@ -590,7 +761,7 @@ class EnhancedTrainer:
         plt.savefig(self.save_dir / 'evaluation_plots.png', dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"✅ 评估可视化已保存: {self.save_dir / 'evaluation_plots.png'}")
+        print(f"[OK] 评估可视化已保存: {self.save_dir / 'evaluation_plots.png'}")
     
     def _generate_interpretability_analysis(
         self,
@@ -599,7 +770,7 @@ class EnhancedTrainer:
         attention_weights: Optional[np.ndarray] = None
     ):
         """生成可解释性分析"""
-        print("🔍 生成可解释性分析...")
+        print("[INTERP] 生成可解释性分析...")
         
         # 获取一些样本进行SHAP分析
         sample_batch = next(iter(test_loader))
@@ -636,10 +807,10 @@ class EnhancedTrainer:
             plt.savefig(self.save_dir / 'shap_analysis.png', dpi=300, bbox_inches='tight')
             plt.close()
             
-            print(f"✅ 特征重要性分析已保存: {self.save_dir / 'shap_analysis.png'}")
+            print(f"[OK] 特征重要性分析已保存: {self.save_dir / 'shap_analysis.png'}")
             
         except Exception as e:
-            print(f"⚠️  SHAP分析失败: {e}")
+            print(f"[WARN] SHAP分析失败: {e}")
             # 如果SHAP失败，至少生成一个简单的特征重要性图
             try:
                 plt.figure(figsize=(12, 8))
@@ -653,9 +824,9 @@ class EnhancedTrainer:
                 plt.tight_layout()
                 plt.savefig(self.save_dir / 'feature_importance.png', dpi=300, bbox_inches='tight')
                 plt.close()
-                print(f"✅ 特征重要性图已保存: {self.save_dir / 'feature_importance.png'}")
+                print(f"[OK] 特征重要性图已保存: {self.save_dir / 'feature_importance.png'}")
             except Exception as e2:
-                print(f"⚠️  特征重要性图也失败: {e2}")
+                print(f"[WARN] 特征重要性图也失败: {e2}")
         
         # 特征重要性分析
         if features is not None:
@@ -687,11 +858,11 @@ class EnhancedTrainer:
                 plt.savefig(self.save_dir / 'pca_analysis.png', dpi=300, bbox_inches='tight')
                 plt.close()
                 
-                print(f"✅ PCA分析已保存: {self.save_dir / 'pca_analysis.png'}")
+                print(f"[OK] PCA分析已保存: {self.save_dir / 'pca_analysis.png'}")
             else:
-                print("⚠️  样本数量不足，跳过PCA分析")
+                print("[WARN] 样本数量不足，跳过PCA分析")
         else:
-            print("⚠️  特征数据不足，跳过PCA分析")
+            print("[WARN] 特征数据不足，跳过PCA分析")
     
     def _analyze_attention_patterns(self, attention_weights: np.ndarray):
         """分析注意力模式"""
@@ -732,7 +903,7 @@ class EnhancedTrainer:
             plt.savefig(self.save_dir / 'attention_analysis.png', dpi=300, bbox_inches='tight')
             plt.close()
             
-            print(f"✅ 注意力分析已保存: {self.save_dir / 'attention_analysis.png'}")
+            print(f"[OK] 注意力分析已保存: {self.save_dir / 'attention_analysis.png'}")
     
     def save_model(self, filename: str = "best_model.pt"):
         """保存模型"""
@@ -744,7 +915,7 @@ class EnhancedTrainer:
             'train_history': self.train_history,
             'val_history': self.val_history
         }, save_path)
-        print(f"💾 模型已保存: {save_path}")
+        print(f"[SAVE] 模型已保存: {save_path}")
     
     def load_model(self, filename: str = "best_model.pt"):
         """加载模型"""
@@ -755,9 +926,9 @@ class EnhancedTrainer:
             self.best_val_auc = checkpoint.get('best_val_auc', 0.0)
             self.train_history = checkpoint.get('train_history', {'loss': [], 'acc': [], 'auc': [], 'f1': []})
             self.val_history = checkpoint.get('val_history', {'loss': [], 'acc': [], 'auc': [], 'f1': []})
-            print(f"📂 模型已加载: {load_path}")
+            print(f"[LOAD] 模型已加载: {load_path}")
         else:
-            print(f"❌ 模型文件不存在: {load_path}")
+            print(f"[ERROR] 模型文件不存在: {load_path}")
     
     def get_model_summary(self) -> Dict[str, Any]:
         """获取模型摘要信息"""
@@ -790,7 +961,7 @@ def compare_models(
     Returns:
         比较结果字典
     """
-    print(f"\n🔄 开始模型比较...")
+    print(f"\n[COMPARE] 开始模型比较...")
     print("=" * 50)
     
     save_dir = Path(save_dir)
@@ -801,7 +972,7 @@ def compare_models(
     
     # 评估每个模型
     for trainer in trainers:
-        print(f"\n📊 评估 {trainer.model_name}...")
+        print(f"\n[EVAL] 评估 {trainer.model_name}...")
         result = trainer.evaluate(test_loader, generate_plots=False)
         results[trainer.model_name] = result
         all_metrics.append({
@@ -813,7 +984,7 @@ def compare_models(
     metrics_df = pd.DataFrame(all_metrics)
     metrics_df = metrics_df.set_index('model')
     
-    print(f"\n📊 模型性能比较:")
+    print(f"\n[COMPARE] 模型性能比较:")
     print(metrics_df.round(4))
     
     # 保存比较结果
@@ -836,7 +1007,7 @@ def _generate_comparison_plots(
     save_dir: Path
 ):
     """生成模型比较图表"""
-    print("📊 生成模型比较可视化...")
+    print("[VIS] 生成模型比较可视化...")
     
     # 提取指标
     model_names = list(results.keys())
@@ -885,10 +1056,10 @@ def _generate_comparison_plots(
     plt.savefig(save_dir / 'roc_comparison.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"✅ 比较可视化已保存: {save_dir}")
+    print(f"[OK] 比较可视化已保存: {save_dir}")
 
 
 if __name__ == "__main__":
-    print("🚀 增强版训练器模块")
+    print("[INFO] 增强版训练器模块")
     print("请通过主脚本使用此训练器")
 

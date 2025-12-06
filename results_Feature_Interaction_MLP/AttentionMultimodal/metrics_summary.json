@@ -1,0 +1,13 @@
+{
+  "model_name": "AttentionMultimodal",
+  "best_val_auc": 0.8095238095238095,
+  "best_epoch": 1,
+  "total_time": 0.8550946712493896,
+  "final_val_auc": 0.1904761904761905,
+  "final_val_acc": 0.5,
+  "final_val_f1": 0.5164835164835165,
+  "test_auc": 0.5357142857142857,
+  "test_acc": 0.6363636363636364,
+  "test_f1": 0.5818181818181819,
+  "test_sensitivity@90%spec": 0.0
+}

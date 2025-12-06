@@ -350,7 +350,7 @@ class EnhancedMMTMFusion(nn.Module):
             tab_embedding_dim: 表格嵌入维度
             num_classes: 分类类别数
             mmtm_bottleneck: MMTM瓶颈维度
-            num_attention_heads: 注意力头数
+            num_attention_heads: 注意力头数（如果维度不匹配，会自动调整）
             fusion_strategy: 融合策略 ('hierarchical', 'concat', 'interaction')
             enable_uncertainty: 是否启用不确定性估计
         """
@@ -360,12 +360,20 @@ class EnhancedMMTMFusion(nn.Module):
         self.fusion_strategy = fusion_strategy
         self.enable_uncertainty = enable_uncertainty
         
+        # 自动调整 num_attention_heads，使其能同时整除 spec_dim 和 tab_dim
+        adjusted_num_heads = self._adjust_num_heads(
+            spec_embedding_dim, tab_embedding_dim, num_attention_heads
+        )
+        if adjusted_num_heads != num_attention_heads:
+            print(f"[WARN] 自动调整注意力头数: {num_attention_heads} -> {adjusted_num_heads} "
+                  f"(因为 tab_dim={tab_embedding_dim} 和 spec_dim={spec_embedding_dim} 不能被 {num_attention_heads} 整除)")
+        
         # 增强版MMTM
         self.enhanced_mmtm = EnhancedMMTM(
             spec_dim=spec_embedding_dim,
             tab_dim=tab_embedding_dim,
             bottleneck_dim=mmtm_bottleneck,
-            num_attention_heads=num_attention_heads
+            num_attention_heads=adjusted_num_heads
         )
         
         # 融合策略
@@ -433,6 +441,27 @@ class EnhancedMMTMFusion(nn.Module):
             nn.Dropout(0.1)
         )
         
+    def _adjust_num_heads(self, spec_dim: int, tab_dim: int, requested_heads: int) -> int:
+        """
+        自动调整注意力头数，使其能同时整除 spec_dim 和 tab_dim
+        
+        Args:
+            spec_dim: 光谱维度
+            tab_dim: 表格维度
+            requested_heads: 用户请求的头数
+        
+        Returns:
+            调整后的头数（能同时整除两个维度，且不超过 requested_heads）
+        """
+        # 找到能同时整除两个维度的最大头数（不超过 requested_heads）
+        # 从 requested_heads 向下搜索到 1
+        for num_heads in range(requested_heads, 0, -1):
+            if spec_dim % num_heads == 0 and tab_dim % num_heads == 0:
+                return num_heads
+        
+        # 如果找不到，返回 1（单个头总是可以工作的）
+        return 1
+    
     def _calculate_hierarchical_fusion_dim(self) -> int:
         """计算层次化融合后的维度"""
         total_dim = 0
@@ -455,8 +484,30 @@ class EnhancedMMTMFusion(nn.Module):
         if len(args) == 2 and isinstance(args[0], dict) and isinstance(args[1], dict):
             # 原始方式：字典格式输入
             spectra_result, tabular_result = args
+
+            # ===== Soft Gating for Missing Modality =====
             spec_emb = spectra_result['embedding']
+            spec_mask = spectra_result.get('mask', None)
+            if spec_mask is not None:
+                m = spec_mask.unsqueeze(-1).float()  # [B,1]
+                # 建立可学习的默认 embedding，用于模态缺失时补偿
+                if not hasattr(self, "_soft_gate_default_spec"):
+                    # 初始化为全部 0 → 不破坏已有 embedding 分布
+                    self._soft_gate_default_spec = nn.Parameter(torch.zeros_like(spec_emb[0:1]))
+                # soft gating
+                spec_emb = spec_emb * m + (1 - m) * self._soft_gate_default_spec
+
             tab_emb = tabular_result['embedding']
+            tab_mask = tabular_result.get('mask', None)
+            if tab_mask is not None:
+                m = tab_mask.unsqueeze(-1).float()  # [B,1]
+                # 建立可学习的默认 embedding，用于模态缺失时补偿
+                if not hasattr(self, "_soft_gate_default_tab"):
+                    # 初始化为全部 0 → 不破坏已有 embedding 分布
+                    self._soft_gate_default_tab = nn.Parameter(torch.zeros_like(tab_emb[0:1]))
+                # soft gating
+                tab_emb = tab_emb * m + (1 - m) * self._soft_gate_default_tab
+
             spec_logits = spectra_result['logits']
             tab_logits = tabular_result['logits']
             
@@ -490,7 +541,17 @@ class EnhancedMMTMFusion(nn.Module):
             tab_logits = self.internal_tab_classifier(tab_emb)
             
         else:
-            raise ValueError(f"❌ 不支持的参数数量: {len(args)}")
+            raise ValueError(f"[ERROR] 不支持的参数数量: {len(args)}")
+        
+        # ===== Learnable Modality Fusion Gate =====
+        if not hasattr(self, "fusion_gate"):
+            # 两个模态各一个权重，初始化为均等
+            self.fusion_gate = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
+        # 归一化权重
+        gate = torch.softmax(self.fusion_gate, dim=0)
+        # 加权模态 embedding
+        spec_emb = spec_emb * gate[0]
+        tab_emb = tab_emb * gate[1]
         
         # 增强版MMTM处理
         spec_enhanced, tab_enhanced, mmtm_info = self.enhanced_mmtm(spec_emb, tab_emb)

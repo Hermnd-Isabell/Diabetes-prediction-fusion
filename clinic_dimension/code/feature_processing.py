@@ -130,10 +130,15 @@ def main():
 
 	processed_df.to_csv(output_dir / 'processed_data.csv', index=False)
 
-	# 导出多模态可用的 PatientID + Group + 特征
-	clinical_df = processed_df.copy()
+	# 导出多模态可用的 PatientID + Label + feature_0...feature_D
+	# 临床导出保持与 processed_df 使用同一特征表示，仅统一命名规范
+	n_features = X_final.shape[1]
+	clinical_feature_cols = [f'feature_{i}' for i in range(n_features)]
+
+	clinical_features_only = processed_df.drop(columns=[label_col])
+	clinical_df = pd.DataFrame(clinical_features_only.values, columns=clinical_feature_cols)
+	clinical_df.insert(0, 'Label', y.values)
 	clinical_df.insert(0, 'PatientID', patient_ids.values)
-	clinical_df = clinical_df.rename(columns={label_col: 'Group'})
 	clinical_path = getattr(cfg, 'clinical_export_path', project_root / 'data' / 'clinical.csv')
 	clinical_path.parent.mkdir(parents=True, exist_ok=True)
 	clinical_df.to_csv(clinical_path, index=False)

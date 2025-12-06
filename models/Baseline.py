@@ -98,6 +98,16 @@ class ConcatFusion(nn.Module):
             # 字典格式输入（来自外部模型）
             spec_embedding = spectra["embedding"]
             tab_embedding = tabular["embedding"]
+            
+            # ===== Learnable Modality Fusion Gate =====
+            if not hasattr(self, "fusion_gate"):
+                # 两个模态各一个权重，初始化为均等
+                self.fusion_gate = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
+            # 归一化权重
+            gate = torch.softmax(self.fusion_gate, dim=0)
+            # 加权模态 embedding
+            spec_embedding = spec_embedding * gate[0]
+            tab_embedding = tab_embedding * gate[1]
         else:
             # 原始张量输入（来自假数据）
             # 处理光谱数据：[B, num_scans, wavelengths] -> [B, wavelengths]
@@ -256,13 +266,57 @@ class BaselineMultimodal(nn.Module):
         # 检查输入格式
         if spectra_result is not None and tabular_result is not None:
             # 字典格式输入（来自外部模型）
+            # ===== Soft Gating for Missing Modality =====
+            if isinstance(spectra_result, dict):
+                spec_emb = spectra_result.get("embedding", None)
+                spec_mask = spectra_result.get("mask", None)
+                if spec_emb is not None and spec_mask is not None:
+                    m = spec_mask.unsqueeze(-1).float()  # [B,1]
+                    # 建立可学习的默认 embedding，用于模态缺失时补偿
+                    if not hasattr(self, "_soft_gate_default_spec"):
+                        # 初始化为全部 0 → 不破坏已有 embedding 分布
+                        self._soft_gate_default_spec = nn.Parameter(torch.zeros_like(spec_emb[0:1]))
+                    # soft gating
+                    spec_emb = spec_emb * m + (1 - m) * self._soft_gate_default_spec
+                    spectra_result = {
+                        **spectra_result,
+                        "embedding": spec_emb
+                    }
+            if isinstance(tabular_result, dict):
+                tab_emb = tabular_result.get("embedding", None)
+                tab_mask = tabular_result.get("mask", None)
+                if tab_emb is not None and tab_mask is not None:
+                    m = tab_mask.unsqueeze(-1).float()  # [B,1]
+                    # 建立可学习的默认 embedding，用于模态缺失时补偿
+                    if not hasattr(self, "_soft_gate_default_tab"):
+                        # 初始化为全部 0 → 不破坏已有 embedding 分布
+                        self._soft_gate_default_tab = nn.Parameter(torch.zeros_like(tab_emb[0:1]))
+                    # soft gating
+                    tab_emb = tab_emb * m + (1 - m) * self._soft_gate_default_tab
+                    tabular_result = {
+                        **tabular_result,
+                        "embedding": tab_emb
+                    }
+
             spec_result = self.spec_encoder(spectra_result=spectra_result, mask=mask)
             tab_result = self.tab_encoder(tabular_result=tabular_result, mask=mask)
             
+            # ===== Learnable Modality Fusion Gate =====
+            spec_emb = spec_result["embedding"]
+            tab_emb = tab_result["embedding"]
+            if not hasattr(self, "fusion_gate"):
+                # 两个模态各一个权重，初始化为均等
+                self.fusion_gate = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
+            # 归一化权重
+            gate = torch.softmax(self.fusion_gate, dim=0)
+            # 加权模态 embedding
+            spec_emb = spec_emb * gate[0]
+            tab_emb = tab_emb * gate[1]
+            
             # 融合两个模态的特征
             fused_result = self.fusion(
-                spectra=spec_result["embedding"], 
-                tabular=tab_result["embedding"], 
+                spectra=spec_emb, 
+                tabular=tab_emb, 
                 mask=mask
             )
             

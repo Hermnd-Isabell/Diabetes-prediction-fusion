@@ -7,6 +7,13 @@ data:
   label_col: Group                   # 标签列名
   max_scans: 180                     # 每个病人最多扫描点数
   
+  # Embedding 模式配置（多模态对齐后的特征）
+  use_embedding: true
+  # Raman 光谱单模态模型导出的 embedding CSV
+  spectrum_embedding_path: spectrum_dimension/diabetes_results/Light_CNN_MLP_features.csv
+  # 临床特征导出的 embedding CSV（由 clinic_dimension/code/feature_processing.py 生成）
+  clinical_embedding_path: data/clinical.csv
+  
   # 数据划分比例
   train_ratio: 0.7                   # 训练集比例
   val_ratio: 0.15                    # 验证集比例
@@ -39,6 +46,11 @@ train:
   epochs: 50                         # 训练轮数
   weight_decay: 1e-4                 # 权重衰减
   early_stopping_patience: 10        # 早停耐心值
+  
+  # 模态 Dropout 配置（仅在 embedding 模式训练集生效）
+  modality_dropout:
+    spectra: 0.15                    # 随机丢弃光谱模态的概率
+    clinical: 0.10                   # 随机丢弃临床模态的概率
   
   # 保存配置
   save_dir: results                  # 结果保存目录

@@ -1,0 +1,13 @@
+{
+  "model_name": "EnhancedMMTM",
+  "best_val_auc": 0.33333333333333337,
+  "best_epoch": 3,
+  "total_time": 1.3744471073150635,
+  "final_val_auc": 0.14285714285714288,
+  "final_val_acc": 0.5,
+  "final_val_f1": 0.5164835164835165,
+  "test_auc": 0.21428571428571427,
+  "test_acc": 0.45454545454545453,
+  "test_f1": 0.45454545454545453,
+  "test_sensitivity@90%spec": 0.14285714285714285
+}
