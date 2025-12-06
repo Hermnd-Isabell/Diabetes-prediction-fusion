@@ -123,6 +123,10 @@ dmypy.json
 # datasets/
 data/spectra.csv
 
+# CSV files
+*.csv
+*.csv.bak
+
 # Results and logs
 results/
 logs/

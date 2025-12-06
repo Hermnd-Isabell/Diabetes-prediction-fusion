@@ -1,4 +1,0 @@
-﻿model_name,feature_file,feature_name,best_val_auc,best_epoch,total_time,final_val_auc,final_val_acc,final_val_f1,test_auc,test_acc,test_f1,test_sensitivity@90%spec
-BaselineMultimodal,Feature_Interaction_MLP_features.csv,Feature_Interaction_MLP,0.7142857142857144,8,1.0595993995666504,0.5714285714285714,0.2,0.2333333333333333,0.5357142857142857,0.45454545454545453,0.4502164502164501,0.0
-AttentionMultimodal,Feature_Interaction_MLP_features.csv,Feature_Interaction_MLP,0.8095238095238095,1,0.8550946712493896,0.1904761904761905,0.5,0.5164835164835165,0.5357142857142857,0.6363636363636364,0.5818181818181819,0.0
-EnhancedMMTM,Feature_Interaction_MLP_features.csv,Feature_Interaction_MLP,0.5714285714285714,7,1.5332341194152832,0.4285714285714286,0.5,0.5318181818181819,0.39285714285714285,0.6363636363636364,0.5818181818181819,0.0
