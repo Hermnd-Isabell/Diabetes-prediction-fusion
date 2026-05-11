@@ -28,6 +28,145 @@ class SpectraEncoder(nn.Module):
 
 
 # ----------------------------
+# 独立的单模态模型 (用于消融实验)
+# ----------------------------
+class SpectraOnlyModel(nn.Module):
+    def __init__(self, input_dim=1000, num_classes=2, hidden_dim=256, lite_cfg=None):
+        super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        # 保存原始 hidden_dim，它同时是 embedding 模式下的输入维度
+        self.orig_hidden_dim = hidden_dim
+        # 使用和 ConcatFusion 相同的 CNN 结构
+        if self.is_lite:
+            cnn_channels = self.lite_cfg.get("cnn_channels", [8, 16, 8])
+            hidden_dim = self.lite_cfg.get("hidden_dim", 32)
+            dropout = self.lite_cfg.get("dropout", 0.3)
+            self.encoder = nn.Sequential(
+                nn.Conv1d(1, cnn_channels[0], kernel_size=7, padding=3),
+                nn.BatchNorm1d(cnn_channels[0]),
+                nn.ReLU(),
+                nn.Conv1d(cnn_channels[0], cnn_channels[1], kernel_size=5, padding=2),
+                nn.BatchNorm1d(cnn_channels[1]),
+                nn.ReLU(),
+                nn.Conv1d(cnn_channels[1], cnn_channels[2], kernel_size=3, padding=1),
+                nn.BatchNorm1d(cnn_channels[2]),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(cnn_channels[2], hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+            self.embedding_proj = nn.Linear(self.orig_hidden_dim, hidden_dim)
+        else:
+            self.encoder = nn.Sequential(
+                nn.Conv1d(1, 64, kernel_size=7, padding=3),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Conv1d(64, 128, kernel_size=5, padding=2),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Conv1d(128, 256, kernel_size=3, padding=1),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(256, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
+            self.embedding_proj = None
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, spectra, mask=None, tabular=None, spectra_result=None, tabular_result=None):
+        # 兼容各种输入调用参数
+        x = spectra
+        # 如果传入的是 dict (embedding模式), 尝试获取其中的 embedding 或 raw data
+        if isinstance(x, dict):
+             if "embedding" in x:
+                 emb = x["embedding"]
+                 if self.is_lite and self.embedding_proj is not None:
+                     emb = self.embedding_proj(emb)
+                 return {"logits": self.classifier(emb), "embedding": emb}
+        
+        # 处理原始光谱数据：[B, num_scans, wavelengths] -> [B, wavelengths]
+        if x.dim() == 3:
+            x = x.mean(dim=1)  # 平均多个扫描
+        x = x.unsqueeze(1)  # [B, 1, wavelengths]
+        
+        embedding = self.encoder(x)
+        logits = self.classifier(embedding)
+        return {"logits": logits, "embedding": embedding}
+
+
+class TabularOnlyModel(nn.Module):
+    def __init__(self, input_dim, num_classes=2, hidden_dim=256, lite_cfg=None):
+        super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        # 保存原始 hidden_dim，它同时是 embedding 模式下的输入维度
+        self.orig_hidden_dim = hidden_dim
+        if self.is_lite:
+            hidden_dim = self.lite_cfg.get("hidden_dim", 32)
+            dropout = self.lite_cfg.get("dropout", 0.3)
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+            self.embedding_proj = nn.Linear(self.orig_hidden_dim, hidden_dim)
+        else:
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, 256),
+                nn.LayerNorm(256),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(256, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
+            self.embedding_proj = None
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, spectra=None, mask=None, tabular=None, spectra_result=None, tabular_result=None):
+         # 兼容各种输入调用参数
+        x = tabular
+
+        # 优先使用 keyword arg
+        if tabular_result is not None:
+            x = tabular_result
+
+        # 如果 positional call, x 可能是 None
+        if x is None:
+            # 如果是 model(tabular_dict) 单参数调用，dict 会被传给 spectra
+            if isinstance(spectra, dict) and "embedding" in spectra:
+                x = spectra
+            elif mask is not None:
+                x = mask
+            # 如果是 model(spectra, mask, tabular) (tabular位是tabular) - 这里的 tabular 参数在上面已经赋值给 x
+
+        if isinstance(x, dict):
+             if "embedding" in x:
+                 emb = x["embedding"]
+                 if self.is_lite and self.embedding_proj is not None:
+                     emb = self.embedding_proj(emb)
+                 return {"logits": self.classifier(emb), "embedding": emb}
+
+        # 如果 x 是 tensor，确保它是 2D (batch, features)
+        # 注意: 此时 x 可能是 mask tensor (如果是 model(spectra, mask) 且 mask 是真实 mask)
+        # 但在 TabularOnlyModel 中我们假设如果有两个输入，第二个是 tabular features (或者 mask 被忽略)
+        
+        embedding = self.encoder(x)
+        logits = self.classifier(embedding)
+        return {"logits": logits, "embedding": embedding}
+
+
+# ----------------------------
 # 临床模态编码器（接收外部ML/DL模型输出）
 # ----------------------------
 class TabularEncoder(nn.Module):
@@ -57,42 +196,74 @@ class TabularEncoder(nn.Module):
 # 融合方式 1: 简单拼接
 # ----------------------------
 class ConcatFusion(nn.Module):
-    def __init__(self, spec_dim=256, clin_dim=128, num_classes=2):
+    def __init__(self, spec_dim=256, clin_dim=128, num_classes=2, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
         self.spec_dim = spec_dim
         self.clin_dim = clin_dim
         self.num_classes = num_classes
-        
+
         # 内部编码器，用于处理原始输入
-        self.internal_spec_encoder = nn.Sequential(
-            nn.Conv1d(1, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(256, spec_dim),
-            nn.LayerNorm(spec_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        
+        if self.is_lite:
+            cnn_channels = self.lite_cfg.get("cnn_channels", [8, 16, 8])
+            hidden_dim = self.lite_cfg.get("hidden_dim", 32)
+            dropout = self.lite_cfg.get("dropout", 0.3)
+            self.internal_spec_encoder = nn.Sequential(
+                nn.Conv1d(1, cnn_channels[0], kernel_size=7, padding=3),
+                nn.BatchNorm1d(cnn_channels[0]),
+                nn.ReLU(),
+                nn.Conv1d(cnn_channels[0], cnn_channels[1], kernel_size=5, padding=2),
+                nn.BatchNorm1d(cnn_channels[1]),
+                nn.ReLU(),
+                nn.Conv1d(cnn_channels[1], cnn_channels[2], kernel_size=3, padding=1),
+                nn.BatchNorm1d(cnn_channels[2]),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(cnn_channels[2], spec_dim),
+                nn.LayerNorm(spec_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+            self.classifier = nn.Sequential(
+                nn.Linear(spec_dim + clin_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, num_classes)
+            )
+        else:
+            self.internal_spec_encoder = nn.Sequential(
+                nn.Conv1d(1, 64, kernel_size=7, padding=3),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Conv1d(64, 128, kernel_size=5, padding=2),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Conv1d(128, 256, kernel_size=3, padding=1),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(256, spec_dim),
+                nn.LayerNorm(spec_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
+            self.classifier = nn.Sequential(
+                nn.Linear(spec_dim + clin_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, num_classes)
+            )
+
         # 表格编码器将在第一次前向传播时动态构建
         self.internal_tab_encoder = None
         self.tab_input_dim = None
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(spec_dim + clin_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, num_classes)
-        )
 
     def forward(self, spectra, mask=None, tabular=None):
+        # 兼容两种调用方式: model(spec_dict, tab_dict) 或 model(spectra, mask, tabular)
+        if isinstance(spectra, dict) and isinstance(mask, dict) and tabular is None:
+            tabular = mask
+            mask = None
         # 检查输入格式
         if isinstance(spectra, dict) and isinstance(tabular, dict):
             # 字典格式输入（来自外部模型）
@@ -116,23 +287,37 @@ class ConcatFusion(nn.Module):
             spectra = spectra.unsqueeze(1)  # [B, 1, wavelengths]
             
             spec_embedding = self.internal_spec_encoder(spectra)  # [B, spec_dim]
-            
+
             # 动态构建表格编码器
             if self.internal_tab_encoder is None or self.tab_input_dim != tabular.shape[-1]:
                 self.tab_input_dim = tabular.shape[-1]
-                self.internal_tab_encoder = nn.Sequential(
-                    nn.Linear(self.tab_input_dim, 256),
-                    nn.LayerNorm(256),
-                    nn.ReLU(),
-                    nn.Dropout(0.1),
-                    nn.Linear(256, self.clin_dim),
-                    nn.LayerNorm(self.clin_dim),
-                    nn.ReLU(),
-                    nn.Dropout(0.1)
-                ).to(tabular.device)
-            
+                if self.is_lite:
+                    h = self.lite_cfg.get("hidden_dim", 32)
+                    dropout = self.lite_cfg.get("dropout", 0.3)
+                    self.internal_tab_encoder = nn.Sequential(
+                        nn.Linear(self.tab_input_dim, h),
+                        nn.LayerNorm(h),
+                        nn.ReLU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(h, self.clin_dim),
+                        nn.LayerNorm(self.clin_dim),
+                        nn.ReLU(),
+                        nn.Dropout(dropout)
+                    ).to(tabular.device)
+                else:
+                    self.internal_tab_encoder = nn.Sequential(
+                        nn.Linear(self.tab_input_dim, 256),
+                        nn.LayerNorm(256),
+                        nn.ReLU(),
+                        nn.Dropout(0.1),
+                        nn.Linear(256, self.clin_dim),
+                        nn.LayerNorm(self.clin_dim),
+                        nn.ReLU(),
+                        nn.Dropout(0.1)
+                    ).to(tabular.device)
+
             tab_embedding = self.internal_tab_encoder(tabular)    # [B, clin_dim]
-        
+
         # 融合特征
         fused = torch.cat([spec_embedding, tab_embedding], dim=-1)   # [B, spec_dim + clin_dim]
         logits = self.classifier(fused)                              # [B, num_classes]
@@ -143,39 +328,66 @@ class ConcatFusion(nn.Module):
 # 融合方式 2: 模态独立分类 + 平均 (Ensemble)
 # ----------------------------
 class EnsembleFusion(nn.Module):
-    def __init__(self, spec_dim=256, clin_dim=128, num_classes=2):
+    def __init__(self, spec_dim=256, clin_dim=128, num_classes=2, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
         self.spec_dim = spec_dim
         self.clin_dim = clin_dim
         self.num_classes = num_classes
-        
+
         # 内部编码器，用于处理原始输入
-        self.internal_spec_encoder = nn.Sequential(
-            nn.Conv1d(1, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(256, spec_dim),
-            nn.LayerNorm(spec_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        
+        if self.is_lite:
+            cnn_channels = self.lite_cfg.get("cnn_channels", [8, 16, 8])
+            dropout = self.lite_cfg.get("dropout", 0.3)
+            self.internal_spec_encoder = nn.Sequential(
+                nn.Conv1d(1, cnn_channels[0], kernel_size=7, padding=3),
+                nn.BatchNorm1d(cnn_channels[0]),
+                nn.ReLU(),
+                nn.Conv1d(cnn_channels[0], cnn_channels[1], kernel_size=5, padding=2),
+                nn.BatchNorm1d(cnn_channels[1]),
+                nn.ReLU(),
+                nn.Conv1d(cnn_channels[1], cnn_channels[2], kernel_size=3, padding=1),
+                nn.BatchNorm1d(cnn_channels[2]),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(cnn_channels[2], spec_dim),
+                nn.LayerNorm(spec_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+        else:
+            self.internal_spec_encoder = nn.Sequential(
+                nn.Conv1d(1, 64, kernel_size=7, padding=3),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Conv1d(64, 128, kernel_size=5, padding=2),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Conv1d(128, 256, kernel_size=3, padding=1),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(256, spec_dim),
+                nn.LayerNorm(spec_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
+
         # 表格编码器将在第一次前向传播时动态构建
         self.internal_tab_encoder = None
         self.tab_input_dim = None
-        
+
         self.spec_head = nn.Linear(spec_dim, num_classes)
         self.clin_head = nn.Linear(clin_dim, num_classes)
 
     def forward(self, spectra, mask=None, tabular=None):
+        # 兼容两种调用方式: model(spec_dict, tab_dict) 或 model(spectra, mask, tabular)
+        if isinstance(spectra, dict) and isinstance(mask, dict) and tabular is None:
+            tabular = mask
+            mask = None
         # 检查输入格式
         if isinstance(spectra, dict) and isinstance(tabular, dict):
             # 字典格式输入（来自外部模型）
@@ -193,19 +405,33 @@ class EnsembleFusion(nn.Module):
             # 动态构建表格编码器
             if self.internal_tab_encoder is None or self.tab_input_dim != tabular.shape[-1]:
                 self.tab_input_dim = tabular.shape[-1]
-                self.internal_tab_encoder = nn.Sequential(
-                    nn.Linear(self.tab_input_dim, 256),
-                    nn.LayerNorm(256),
-                    nn.ReLU(),
-                    nn.Dropout(0.1),
-                    nn.Linear(256, self.clin_dim),
-                    nn.LayerNorm(self.clin_dim),
-                    nn.ReLU(),
-                    nn.Dropout(0.1)
-                ).to(tabular.device)
-            
+                if self.is_lite:
+                    h = self.lite_cfg.get("hidden_dim", 32)
+                    dropout = self.lite_cfg.get("dropout", 0.3)
+                    self.internal_tab_encoder = nn.Sequential(
+                        nn.Linear(self.tab_input_dim, h),
+                        nn.LayerNorm(h),
+                        nn.ReLU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(h, self.clin_dim),
+                        nn.LayerNorm(self.clin_dim),
+                        nn.ReLU(),
+                        nn.Dropout(dropout)
+                    ).to(tabular.device)
+                else:
+                    self.internal_tab_encoder = nn.Sequential(
+                        nn.Linear(self.tab_input_dim, 256),
+                        nn.LayerNorm(256),
+                        nn.ReLU(),
+                        nn.Dropout(0.1),
+                        nn.Linear(256, self.clin_dim),
+                        nn.LayerNorm(self.clin_dim),
+                        nn.ReLU(),
+                        nn.Dropout(0.1)
+                    ).to(tabular.device)
+
             tab_embedding = self.internal_tab_encoder(tabular)    # [B, clin_dim]
-        
+
         # 独立分类
         logits_spec = self.spec_head(spec_embedding)        # [B, num_classes]
         logits_clin = self.clin_head(tab_embedding)         # [B, num_classes]
@@ -220,20 +446,20 @@ class EnsembleFusion(nn.Module):
 # 完整的多模态融合模型
 # ----------------------------
 class BaselineMultimodal(nn.Module):
-    def __init__(self, spec_embedding_dim=256, tab_embedding_dim=128, num_classes=2, fusion_type='concat'):
+    def __init__(self, spec_embedding_dim=256, tab_embedding_dim=128, num_classes=2, fusion_type='concat', lite_cfg=None):
         super().__init__()
         self.spec_embedding_dim = spec_embedding_dim
         self.tab_embedding_dim = tab_embedding_dim
         self.num_classes = num_classes
         self.fusion_type = fusion_type
-        
+
         self.spec_encoder = SpectraEncoder(spec_embedding_dim=spec_embedding_dim, num_classes=num_classes)
         self.tab_encoder = TabularEncoder(tab_embedding_dim=tab_embedding_dim, num_classes=num_classes)
-        
+
         if fusion_type == 'concat':
-            self.fusion = ConcatFusion(spec_dim=spec_embedding_dim, clin_dim=tab_embedding_dim, num_classes=num_classes)
+            self.fusion = ConcatFusion(spec_dim=spec_embedding_dim, clin_dim=tab_embedding_dim, num_classes=num_classes, lite_cfg=lite_cfg)
         elif fusion_type == 'ensemble':
-            self.fusion = EnsembleFusion(spec_dim=spec_embedding_dim, clin_dim=tab_embedding_dim, num_classes=num_classes)
+            self.fusion = EnsembleFusion(spec_dim=spec_embedding_dim, clin_dim=tab_embedding_dim, num_classes=num_classes, lite_cfg=lite_cfg)
         else:
             raise ValueError(f"Unknown fusion type: {fusion_type}")
 

@@ -20,6 +20,7 @@ import json
 import time
 import warnings
 from pathlib import Path
+import sys
 from typing import Dict, List, Tuple, Optional, Any, Union
 
 import torch
@@ -38,6 +39,26 @@ from sklearn.metrics import (
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 import shap
+from models.tft_models import TFTLoss
+
+# 兼容性修复：处理 Numpy 2.0 checkpiont 在 Numpy 1.x 环境下的加载问题
+import numpy as np
+try:
+    import numpy._core
+except ImportError:
+    # 如果找不到 numpy._core (Numpy 1.x)，但 checkpoint 引用了它 (Numpy 2.0+)
+    # 将 numpy.core 映射到 numpy._core
+    if hasattr(np, 'core'):
+        import sys
+        sys.modules['numpy._core'] = np.core
+        # 同时也可能需要 multiarray
+        try:
+            from numpy.core import multiarray
+            sys.modules['numpy._core.multiarray'] = multiarray
+        except ImportError:
+            pass
+        print("[DEBUG] Applied numpy 2.0 -> 1.x compatibility hack")
+
 
 # 设置matplotlib中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
@@ -45,6 +66,105 @@ plt.rcParams['axes.unicode_minus'] = False
 
 # 忽略警告
 warnings.filterwarnings('ignore')
+
+# ----------------------------
+# 高级训练策略：Focal Loss
+# ----------------------------
+class FocalLoss(nn.Module):
+    """Focal Loss with optional label smoothing support."""
+    def __init__(self, gamma=2.0, weight=None, label_smoothing=0.0, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+        self.weight = weight
+        if self.label_smoothing > 0:
+            # When label smoothing is used with focal, we use BCEWithLogitsLoss
+            self.base_criterion = nn.BCEWithLogitsLoss(weight=weight, reduction='none')
+        else:
+            self.base_criterion = nn.CrossEntropyLoss(weight=weight, reduction='none')
+
+    def forward(self, inputs, targets):
+        if self.label_smoothing > 0:
+            num_classes = inputs.size(1)
+            # One-hot with smoothing
+            targets_one_hot = torch.zeros_like(inputs).scatter_(1, targets.unsqueeze(1), 1)
+            targets_smooth = targets_one_hot * (1 - self.label_smoothing) + self.label_smoothing / num_classes
+            ce_loss = self.base_criterion(inputs, targets_smooth).sum(dim=1)
+        else:
+            ce_loss = self.base_criterion(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss)
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+
+# ----------------------------
+# 高级训练策略：SAM (Sharpness-Aware Minimization)
+# ----------------------------
+class SAM(torch.optim.Optimizer):
+    """
+    Lightweight SAM wrapper.
+    Requires two forward-backward passes per step.
+    """
+    def __init__(self, params, base_optimizer, rho=0.05):
+        defaults = dict(rho=rho)
+        super().__init__(params, defaults)
+        self.base_optimizer = base_optimizer
+        self.param_groups = self.base_optimizer.param_groups
+        # Inject rho into each param_group
+        for group in self.param_groups:
+            group['rho'] = rho
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            scale = group['rho'] / (grad_norm + 1e-12)
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                e_w = p.grad * scale
+                p.add_(e_w)  # w -> w + e(w)
+                self.state[p]['e_w'] = e_w
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                p.sub_(self.state[p]['e_w'])  # w + e(w) -> w
+        self.base_optimizer.step()  # update at w
+        if zero_grad:
+            self.zero_grad()
+
+    def zero_grad(self):
+        self.base_optimizer.zero_grad()
+
+    def _grad_norm(self):
+        shared_device = self.param_groups[0]['params'][0].device
+        norm = torch.norm(
+            torch.stack([
+                p.grad.norm(p=2).to(shared_device)
+                for group in self.param_groups
+                for p in group['params']
+                if p.grad is not None
+            ]),
+            p=2
+        )
+        return norm
+
+    def state_dict(self):
+        return self.base_optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.base_optimizer.load_state_dict(state_dict)
 
 
 class EnhancedTrainer:
@@ -65,10 +185,15 @@ class EnhancedTrainer:
         enable_visualization: bool = True,
         enable_interpretability: bool = True,
         use_embedding_input: bool = False,
+        class_weights: Optional[torch.Tensor] = None,
+        advanced_cfg: Optional[Dict[str, Any]] = None,
+        num_classes: int = 2,
+        fold_idx: Optional[int] = None,
+        evaluation_cfg: Optional[Dict[str, Any]] = None,
     ):
         """
         初始化增强版训练器
-        
+
         Args:
             model: 要训练的模型
             model_name: 模型名称
@@ -78,46 +203,81 @@ class EnhancedTrainer:
             save_dir: 结果保存目录
             enable_visualization: 是否启用可视化
             enable_interpretability: 是否启用可解释性分析
+            use_embedding_input: 是否使用了 embedding 输入
+            class_weights: 类别权重 (用于处理由于类别不平衡)
+            advanced_cfg: 高级训练策略配置字典
+            num_classes: 类别数
         """
         self.model = model.to(device)
         self.model_name = model_name
         self.device = device
         self.save_dir = Path(save_dir) / model_name
+        if fold_idx is not None:
+            self.save_dir = self.save_dir / f"fold_{fold_idx}"
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 输入模式设置：原始序列输入 or 直接 embedding 输入
         self.use_embedding_input = use_embedding_input
-        
-        # 训练设置
-        self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay
-        )
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', patience=5, factor=0.5
-        )
-        
+        self.advanced_cfg = advanced_cfg or {}
+        self.advanced_enabled = self.advanced_cfg.get('enabled', False)
+        self.num_classes = num_classes
+        self.base_lr = lr
+        self.base_wd = weight_decay
+        self.fold_idx = fold_idx
+
+        # 评估指标配置（独立于 advanced.enabled）
+        eval_cfg = evaluation_cfg or {}
+        metrics_cfg = eval_cfg.get('metrics', {})
+        self.compute_macro_auc = metrics_cfg.get('compute_macro_auc', False)
+        self.compute_weighted_auc = metrics_cfg.get('compute_weighted_auc', False)
+        self.compute_cohens_kappa = metrics_cfg.get('compute_cohens_kappa', False)
+        self.compute_qwk = metrics_cfg.get('compute_qwk', False)
+
+        # 高级配置项解析（向后兼容：advanced 缺失时取默认值）
+        self.loss_type = self.advanced_cfg.get('loss_type', 'CE')
+        self.focal_gamma = self.advanced_cfg.get('focal_gamma', 2.0)
+        self.label_smoothing = self.advanced_cfg.get('label_smoothing', 0.0)
+        self.aux_weight = self.advanced_cfg.get('aux_weight', 1.0)
+        self.current_aux_weight = self.aux_weight
+        self.aux_decay_schedule = self.advanced_cfg.get('aux_decay_schedule', None)
+        self.grad_clip_max_norm = self.advanced_cfg.get('grad_clip_max_norm', None)
+        self.scheduler_type = self.advanced_cfg.get('scheduler_type', 'plateau')
+        self.warmup_epochs = self.advanced_cfg.get('warmup_epochs', 0)
+        self.cosine_T_max = self.advanced_cfg.get('cosine_T_max', 100)
+        self.early_stop_metric = self.advanced_cfg.get('early_stop_metric', 'auc')
+        self.early_stop_patience = self.advanced_cfg.get('early_stop_patience', None)
+        self.phase_training_cfg = self.advanced_cfg.get('phase_training', {})
+        self.phase_training_enabled = self.phase_training_cfg.get('enabled', False)
+
+        # 训练设置：损失函数
+        if self.model_name == 'TFTMultimodal':
+            print(f"[TRAIN] TFT模型使用自定义 TFTLoss")
+            self.criterion = TFTLoss().to(device)
+        else:
+            self.criterion = self._build_criterion(class_weights)
+
+        # 训练设置：优化器与调度器
+        self.optimizer, self.base_optimizer = self._setup_optimizer(lr, weight_decay)
+        self.scheduler = self._setup_scheduler()
+
         # 功能开关
         self.enable_visualization = enable_visualization
         self.enable_interpretability = enable_interpretability
-        
-        # 训练历史
+
+        # 训练历史（扩展以容纳新指标）
         self.train_history = {
             'loss': [], 'acc': [], 'auc': [], 'f1': []
         }
         self.val_history = {
             'loss': [], 'acc': [], 'auc': [], 'f1': []
         }
-        
+
         # 最佳模型
-        self.best_val_auc = 0.0
+        self.best_val_metric = float('-inf')
         self.best_model_state = None
-        
+        self.best_epoch = 0
+
         # 模态权重历史记录（用于可视化）
         self.modality_gate_history = []
-        
+
         print(f"[INIT] 增强版训练器初始化完成")
         print(f"[MODEL] 模型: {model_name}")
         print(f"[DEVICE] 设备: {device}")
@@ -125,16 +285,198 @@ class EnhancedTrainer:
         print(f"[VIS] 可视化: {'启用' if enable_visualization else '禁用'}")
         print(f"[INTERP] 可解释性: {'启用' if enable_interpretability else '禁用'}")
         print(f"[MODE] 输入模式: {'embedding' if self.use_embedding_input else 'raw 序列'}")
+        if self.advanced_enabled:
+            print(f"[ADVANCED] 高级训练策略已启用: loss={self.loss_type}, scheduler={self.scheduler_type}, optimizer={self.advanced_cfg.get('optimizer', 'AdamW')}")
+
+    def _build_criterion(self, class_weights: Optional[torch.Tensor] = None):
+        """构建损失函数（支持 CE / Focal / Label Smoothing）"""
+        if not self.advanced_enabled:
+            if class_weights is not None:
+                return nn.CrossEntropyLoss(weight=class_weights.to(self.device))
+            return nn.CrossEntropyLoss()
+
+        if self.loss_type == 'Focal':
+            return FocalLoss(
+                gamma=self.focal_gamma,
+                weight=class_weights.to(self.device) if class_weights is not None else None,
+                label_smoothing=self.label_smoothing,
+            )
+        elif self.loss_type == 'CORN':
+            raise NotImplementedError("CORN loss is not yet implemented. Please use 'CE' or 'Focal'.")
+        elif self.loss_type == 'CE':
+            if self.label_smoothing > 0:
+                return nn.CrossEntropyLoss(
+                    weight=class_weights.to(self.device) if class_weights is not None else None,
+                    label_smoothing=self.label_smoothing
+                )
+            if class_weights is not None:
+                return nn.CrossEntropyLoss(weight=class_weights.to(self.device))
+            return nn.CrossEntropyLoss()
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+    def _setup_optimizer(self, lr: float, weight_decay: float):
+        """构建优化器（支持分层参数组与 SAM）"""
+        optimizer_name = self.advanced_cfg.get('optimizer', 'AdamW') if self.advanced_enabled else 'AdamW'
+        param_groups_cfg = self.advanced_cfg.get('param_groups', None) if self.advanced_enabled else None
+
+        if not self.advanced_enabled or param_groups_cfg is None:
+            # 默认全局单组
+            base_opt = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+            if optimizer_name == 'AdamW_SAM':
+                rho = self.advanced_cfg.get('sam_rho', 0.05)
+                sam = SAM(self.model.parameters(), base_opt, rho=rho)
+                return sam, base_opt
+            return base_opt, base_opt
+
+        # 分层参数组
+        groups = []
+        assigned_ids = set()
+
+        def collect_params(keywords, name):
+            params = []
+            for n, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if id(p) in assigned_ids:
+                    continue
+                if any(kw in n for kw in keywords):
+                    params.append(p)
+                    assigned_ids.add(id(p))
+            return params
+
+        # spectra_encoder
+        spec_params = collect_params(['spectra', 'spec'], 'spectra_encoder')
+        if spec_params:
+            mul = param_groups_cfg.get('spectra_encoder', {}).get('lr_multiplier', 1.0)
+            wd_mul = param_groups_cfg.get('spectra_encoder', {}).get('wd_multiplier', 1.0)
+            groups.append({'params': spec_params, 'lr': lr * mul, 'weight_decay': weight_decay * wd_mul, 'name': 'spectra_encoder'})
+
+        # clinical_encoder
+        clin_params = collect_params(['clinical', 'tabular', 'tab'], 'clinical_encoder')
+        if clin_params:
+            mul = param_groups_cfg.get('clinical_encoder', {}).get('lr_multiplier', 1.0)
+            wd_mul = param_groups_cfg.get('clinical_encoder', {}).get('wd_multiplier', 1.0)
+            groups.append({'params': clin_params, 'lr': lr * mul, 'weight_decay': weight_decay * wd_mul, 'name': 'clinical_encoder'})
+
+        # fusion_module
+        fusion_params = collect_params(['fusion', 'cross', 'mmtm', 'attention'], 'fusion_module')
+        if fusion_params:
+            mul = param_groups_cfg.get('fusion_module', {}).get('lr_multiplier', 1.0)
+            wd_mul = param_groups_cfg.get('fusion_module', {}).get('wd_multiplier', 1.0)
+            groups.append({'params': fusion_params, 'lr': lr * mul, 'weight_decay': weight_decay * wd_mul, 'name': 'fusion_module'})
+
+        # classifier_head
+        head_params = collect_params(['classifier', 'head'], 'classifier_head')
+        if head_params:
+            mul = param_groups_cfg.get('classifier_head', {}).get('lr_multiplier', 1.0)
+            wd_mul = param_groups_cfg.get('classifier_head', {}).get('wd_multiplier', 1.0)
+            groups.append({'params': head_params, 'lr': lr * mul, 'weight_decay': weight_decay * wd_mul, 'name': 'classifier_head'})
+
+        # 兜底默认组
+        remaining = [p for p in self.model.parameters() if id(p) not in assigned_ids and p.requires_grad]
+        if remaining:
+            groups.append({'params': remaining, 'lr': lr, 'weight_decay': weight_decay, 'name': 'default'})
+
+        print(f"[OPT] 分层参数组 ({len(groups)} 组):")
+        for g in groups:
+            print(f"  - {g['name']}: n_params={sum(p.numel() for p in g['params'])}, lr={g['lr']:.2e}, wd={g['weight_decay']:.2e}")
+
+        base_opt = optim.AdamW(groups)
+        if optimizer_name == 'AdamW_SAM':
+            rho = self.advanced_cfg.get('sam_rho', 0.05)
+            sam = SAM([g['params'] for g in groups], base_opt, rho=rho)
+            return sam, base_opt
+        return base_opt, base_opt
+
+    def _setup_scheduler(self):
+        """构建学习率调度器"""
+        if not self.advanced_enabled or self.scheduler_type == 'plateau':
+            return optim.lr_scheduler.ReduceLROnPlateau(
+                self.base_optimizer, mode='min', patience=5, factor=0.5
+            )
+        elif self.scheduler_type == 'cosine':
+            return optim.lr_scheduler.CosineAnnealingLR(
+                self.base_optimizer, T_max=self.cosine_T_max
+            )
+        else:
+            raise ValueError(f"Unknown scheduler_type: {self.scheduler_type}")
+
+    def _compute_loss(self, outputs, labels):
+        """统一损失计算（含辅助损失）"""
+        logits = outputs["logits"]
+
+        if self.model_name == 'TFTMultimodal':
+            loss_dict = self.criterion(outputs, labels)
+            return loss_dict["total_loss"]
+
+        main_loss = self.criterion(logits, labels)
+        total_loss = main_loss
+
+        # 辅助损失（AttentionMultimodal / TFTMultimodal 的 aux_spec_logits / aux_tab_logits）
+        if self.current_aux_weight > 0:
+            aux_spec = outputs.get("aux_spec_logits", None)
+            aux_tab = outputs.get("aux_tab_logits", None)
+            if aux_spec is not None:
+                total_loss = total_loss + self.current_aux_weight * self.criterion(aux_spec, labels)
+            if aux_tab is not None:
+                total_loss = total_loss + self.current_aux_weight * self.criterion(aux_tab, labels)
+
+        return total_loss
+
+    def _apply_phase_training(self, epoch: int):
+        """渐进式训练：冻结/解冻参数"""
+        if not self.advanced_enabled or not self.phase_training_enabled:
+            return
+
+        phase1_epochs = self.phase_training_cfg.get('phase1_epochs', 20)
+        phase1_modules = self.phase_training_cfg.get('phase1_modules', [])
+        phase2_modules = self.phase_training_cfg.get('phase2_modules', [])
+
+        if epoch < phase1_epochs:
+            active_modules = phase1_modules
+        else:
+            active_modules = phase1_modules + phase2_modules
+
+        # 将配置中的模块名映射到参数名子串（与 _setup_optimizer 一致）
+        keyword_map = {
+            'spectra_encoder': ['spectra', 'spec'],
+            'clinical_encoder': ['clinical', 'tabular', 'tab'],
+            'fusion_module': ['fusion', 'cross', 'mmtm', 'attention'],
+            'classifier_head': ['classifier', 'head'],
+        }
+        active_keywords = []
+        for mod in active_modules:
+            active_keywords.extend(keyword_map.get(mod, [mod]))
+
+        for name, param in self.model.named_parameters():
+            should_train = any(kw in name for kw in active_keywords)
+            param.requires_grad = should_train
+
+        if epoch == phase1_epochs:
+            print(f"[PHASE] Phase 2 开始 (epoch {epoch+1})，解冻模块: {phase2_modules}")
+
+    def _update_aux_weight(self, epoch: int):
+        """辅助损失权重衰减"""
+        if not self.advanced_enabled or self.aux_decay_schedule is None:
+            return
+        decay_every, decay_factor = self.aux_decay_schedule
+        if decay_every > 0 and (epoch + 1) % decay_every == 0:
+            self.current_aux_weight = max(0.01, self.current_aux_weight * decay_factor)
+            print(f"[AUX] aux_weight 衰减至 {self.current_aux_weight:.4f} (epoch {epoch+1})")
     
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
-        """训练一个epoch"""
+        """训练一个epoch（支持SAM双步与梯度裁剪）"""
         self.model.train()
         total_loss = 0.0
         all_preds = []
         all_labels = []
         all_probs = []
-        
-        pbar = tqdm(train_loader, desc=f"训练 {self.model_name}")
+        all_probs_full = []
+
+        use_sam = self.advanced_enabled and self.advanced_cfg.get('optimizer', 'AdamW') == 'AdamW_SAM'
+
+        pbar = tqdm(train_loader, desc=f"训练 {self.model_name}", file=sys.stdout)
         for step, batch in enumerate(pbar):
             # 数据准备
             spectra = batch["spectra"].to(self.device)
@@ -149,58 +491,79 @@ class EnhancedTrainer:
                 has_spectra = has_spectra.to(self.device)
             if has_tabular is not None:
                 has_tabular = has_tabular.to(self.device)
-            
+
+            def forward_step():
+                if not self.use_embedding_input:
+                    outputs = self.model(spectra, mask, tabular)
+                else:
+                    if step == 0:
+                        print("[INFO] 当前使用 embedding 输入模式：model(spectra_dict, tabular_dict)")
+                        if has_spectra is not None and has_tabular is not None:
+                            ratio_spec = has_spectra.float().mean().item()
+                            ratio_tab = has_tabular.float().mean().item()
+                            print(f"[INFO] embedding 模式：本 batch 中有光谱的比例={ratio_spec:.2f}, 有临床的比例={ratio_tab:.2f}")
+                    spectra_result = {
+                        "embedding": spectra,
+                        "mask": has_spectra,
+                        "logits": None,
+                    }
+                    tabular_result = {
+                        "embedding": tabular,
+                        "mask": has_tabular,
+                        "logits": None,
+                    }
+                    outputs = self.model(spectra_result, tabular_result)
+                return outputs
+
             # 前向传播
             self.optimizer.zero_grad()
-            if not self.use_embedding_input:
-                # raw 模式：保持原有调用方式
-                outputs = self.model(spectra, mask, tabular)
+            outputs = forward_step()
+            loss = self._compute_loss(outputs, labels)
+
+            # SAM 双步训练
+            if use_sam:
+                loss.backward()
+                self.optimizer.first_step(zero_grad=True)
+                outputs_adv = forward_step()
+                loss_adv = self._compute_loss(outputs_adv, labels)
+                loss_adv.backward()
+                self.optimizer.second_step(zero_grad=True)
             else:
-                # embedding 模式：包装为外部模型输出字典，并携带缺模态 mask
-                if step == 0:
-                    print("[INFO] 当前使用 embedding 输入模式：model(spectra_dict, tabular_dict)")
-                    if has_spectra is not None and has_tabular is not None:
-                        ratio_spec = has_spectra.float().mean().item()
-                        ratio_tab = has_tabular.float().mean().item()
-                        print(f"[INFO] embedding 模式：本 batch 中有光谱的比例={ratio_spec:.2f}, 有临床的比例={ratio_tab:.2f}")
-                spectra_result = {
-                    "embedding": spectra,
-                    "mask": has_spectra,
-                    "logits": None,
-                }
-                tabular_result = {
-                    "embedding": tabular,
-                    "mask": has_tabular,
-                    "logits": None,
-                }
-                outputs = self.model(spectra_result, tabular_result)
+                loss.backward()
+                # 梯度裁剪
+                if self.advanced_enabled and self.grad_clip_max_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_max_norm)
+                elif not self.advanced_enabled:
+                    # 默认行为：保持原有硬编码裁剪
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
             logits = outputs["logits"]
-            loss = self.criterion(logits, labels)
-            
-            # 反向传播
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            
             # 统计
             total_loss += loss.item() * labels.size(0)
             probs = torch.softmax(logits, dim=1)
             preds = torch.argmax(logits, dim=1)
-            
+
             all_preds.extend(preds.detach().cpu().numpy())
             all_labels.extend(labels.detach().cpu().numpy())
             all_probs.extend(probs[:, 1].detach().cpu().numpy())
-            
+            # 收集完整概率矩阵用于多类 Macro-AUC
+            if (self.compute_macro_auc or self.compute_weighted_auc) and probs.shape[1] > 1:
+                all_probs_full.append(probs.detach().cpu().numpy())
+
             # 更新进度条
+            lr_display = self.base_optimizer.param_groups[0]["lr"] if hasattr(self, 'base_optimizer') else self.optimizer.param_groups[0]["lr"]
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
-                'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
+                'lr': f'{lr_display:.2e}'
             })
-        
+
         # 计算指标
-        metrics = self._calculate_metrics(all_labels, all_probs, all_preds)
-        metrics['loss'] = total_loss / len(train_loader.dataset)
-        
+        probs_matrix = np.vstack(all_probs_full) if all_probs_full else None
+        metrics = self._calculate_metrics(all_labels, all_probs, all_preds, probs_matrix=probs_matrix)
+        n_samples = len(train_loader.dataset) if hasattr(train_loader, 'dataset') else len(all_labels)
+        metrics['loss'] = total_loss / max(n_samples, 1)
+
         return metrics
     
     def eval_epoch(self, val_loader: DataLoader) -> Dict[str, float]:
@@ -210,10 +573,11 @@ class EnhancedTrainer:
         all_preds = []
         all_labels = []
         all_probs = []
+        all_probs_full = []
         all_features = []
         
         with torch.no_grad():
-            pbar = tqdm(val_loader, desc=f"验证 {self.model_name}")
+            pbar = tqdm(val_loader, desc=f"验证 {self.model_name}", file=sys.stdout)
             for batch in pbar:
                 # 数据准备
                 spectra = batch["spectra"].to(self.device)
@@ -247,8 +611,10 @@ class EnhancedTrainer:
                     }
                     outputs = self.model(spectra_result, tabular_result)
                 logits = outputs["logits"]
-                loss = self.criterion(logits, labels)
-                
+
+                # 计算损失
+                loss = self._compute_loss(outputs, labels)
+
                 # 统计
                 total_loss += loss.item() * labels.size(0)
                 probs = torch.softmax(logits, dim=1)
@@ -257,21 +623,26 @@ class EnhancedTrainer:
                 all_preds.extend(preds.detach().cpu().numpy())
                 all_labels.extend(labels.detach().cpu().numpy())
                 all_probs.extend(probs[:, 1].detach().cpu().numpy())
-                
+                # 收集完整概率矩阵用于多类 Macro-AUC
+                if (self.compute_macro_auc or self.compute_weighted_auc) and probs.shape[1] > 1:
+                    all_probs_full.append(probs.detach().cpu().numpy())
+
                 # 收集特征用于可视化
                 if 'embedding' in outputs:
                     all_features.append(outputs['embedding'].cpu().numpy())
-                
+
                 pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-        
+
         # 计算指标
-        metrics = self._calculate_metrics(all_labels, all_probs, all_preds)
-        metrics['loss'] = total_loss / len(val_loader.dataset)
-        
+        probs_matrix = np.vstack(all_probs_full) if all_probs_full else None
+        metrics = self._calculate_metrics(all_labels, all_probs, all_preds, probs_matrix=probs_matrix)
+        n_samples = len(val_loader.dataset) if hasattr(val_loader, 'dataset') else len(all_labels)
+        metrics['loss'] = total_loss / max(n_samples, 1)
+
         # 保存特征用于后续分析
         if all_features:
             metrics['features'] = np.vstack(all_features)
-        
+
         return metrics
     
     def _log_modality_gates(self, epoch: int):
@@ -302,28 +673,41 @@ class EnhancedTrainer:
         }
         self.modality_gate_history.append(record)
     
-    def _calculate_metrics(self, y_true: List, y_prob: List, y_pred: List) -> Dict[str, float]:
-        """计算评估指标"""
+    def _calculate_metrics(self, y_true: List, y_prob: List, y_pred: List, probs_matrix: Optional[np.ndarray] = None) -> Dict[str, float]:
+        """计算评估指标（含扩展指标）
+
+        Args:
+            y_true: 真实标签
+            y_prob: 第1类的正类概率（向后兼容）
+            y_pred: 预测标签
+            probs_matrix: 完整的 softmax 概率矩阵 [N, C]，用于多类 Macro-AUC / Weighted-AUC
+        """
+        from sklearn.metrics import cohen_kappa_score, roc_auc_score
+        from sklearn.preprocessing import label_binarize
         y_true = np.array(y_true)
         y_prob = np.array(y_prob)
         y_pred = np.array(y_pred)
+
+        # 空输入保护
+        if len(y_true) == 0:
+            return {
+                'acc': np.nan, 'auc': np.nan, 'f1': np.nan,
+                'macro_f1': np.nan, 'sensitivity@90%spec': np.nan
+            }
 
         # 统一二分类 / 多分类的评估逻辑
         classes = np.unique(y_true)
         num_classes = len(classes)
 
-        # 准确率 & 加权 F1（sklearn 已支持多分类）
+        # 准确率 & F1
         acc = accuracy_score(y_true, y_pred)
-        f1 = f1_score(y_true, y_pred, average='weighted')
+        f1_weighted = f1_score(y_true, y_pred, average='weighted')
+        f1_macro = f1_score(y_true, y_pred, average='macro')
 
-        # 对于 AUC 和 sensitivity@90%spec：
-        # - 二分类：直接使用原始标签和正类概率
-        # - 多分类：退化为某一类（默认 label=1，如无则使用最大标签）的 one-vs-rest 指标，
-        #   避免 sklearn 在多分类上抛出 "multiclass format is not supported" 错误。
+        # OvR 正类（用于 AUC 计算）
         if num_classes <= 2:
             y_binary = y_true
         else:
-            # 选择一个“疾病”相关的正类：优先使用标签 1，否则使用最大标签
             pos_label = 1 if 1 in classes else classes.max()
             y_binary = (y_true == pos_label).astype(int)
 
@@ -331,6 +715,43 @@ class EnhancedTrainer:
             auc = roc_auc_score(y_binary, y_prob)
         except ValueError:
             auc = np.nan
+
+        # 扩展 AUC 指标（Macro / Weighted）
+        macro_auc = np.nan
+        weighted_auc = np.nan
+        if probs_matrix is not None and probs_matrix.ndim == 2 and probs_matrix.shape[1] > 1:
+            n_classes_prob = probs_matrix.shape[1]
+            if self.compute_macro_auc or self.compute_weighted_auc:
+                try:
+                    if self.compute_macro_auc:
+                        macro_auc = roc_auc_score(y_true, probs_matrix, multi_class='ovr', average='macro')
+                    if self.compute_weighted_auc:
+                        weighted_auc = roc_auc_score(y_true, probs_matrix, multi_class='ovr', average='weighted')
+                except ValueError:
+                    # 某折缺少某类 → 退化为逐类手动计算
+                    try:
+                        all_classes = np.arange(n_classes_prob)
+                        y_true_bin = label_binarize(y_true, classes=all_classes)
+                        if y_true_bin.shape[1] < n_classes_prob:
+                            n_missing = n_classes_prob - y_true_bin.shape[1]
+                            y_true_bin = np.pad(y_true_bin, ((0, 0), (0, n_missing)), mode='constant')
+                        per_class_aucs = []
+                        weighted_per_class = []
+                        for i in range(n_classes_prob):
+                            col = y_true_bin[:, i]
+                            if np.sum(col) > 0 and np.sum(col) < len(col):
+                                auc_i = roc_auc_score(col, probs_matrix[:, i])
+                                per_class_aucs.append(auc_i)
+                                weighted_per_class.append(auc_i * np.sum(col))
+                        if per_class_aucs:
+                            if self.compute_macro_auc:
+                                macro_auc = float(np.mean(per_class_aucs))
+                            if self.compute_weighted_auc:
+                                total_support = np.sum([np.sum(y_true_bin[:, i]) for i in range(n_classes_prob) if np.sum(y_true_bin[:, i]) > 0])
+                                if total_support > 0:
+                                    weighted_auc = float(np.sum(weighted_per_class) / total_support)
+                    except Exception:
+                        pass
 
         try:
             fpr, tpr, _ = roc_curve(y_binary, y_prob)
@@ -340,12 +761,32 @@ class EnhancedTrainer:
         except ValueError:
             sens_at_90 = np.nan
 
-        return {
+        result = {
             'acc': acc,
             'auc': auc,
-            'f1': f1,
+            'f1': f1_weighted,
+            'macro_f1': f1_macro,
             'sensitivity@90%spec': sens_at_90
         }
+
+        if self.compute_macro_auc and not np.isnan(macro_auc):
+            result['macro_auc'] = macro_auc
+        if self.compute_weighted_auc and not np.isnan(weighted_auc):
+            result['weighted_auc'] = weighted_auc
+
+        # Cohen's Kappa / QWK（独立于 advanced.enabled）
+        if self.compute_cohens_kappa:
+            try:
+                result['cohens_kappa'] = cohen_kappa_score(y_true, y_pred)
+            except Exception:
+                result['cohens_kappa'] = np.nan
+        if self.compute_qwk:
+            try:
+                result['qwk'] = cohen_kappa_score(y_true, y_pred, weights='quadratic')
+            except Exception:
+                result['qwk'] = np.nan
+
+        return result
     
     def train(
         self,
@@ -356,38 +797,72 @@ class EnhancedTrainer:
         save_best: bool = True
     ) -> Dict[str, Any]:
         """
-        完整训练流程
-        
-        Args:
-            train_loader: 训练数据加载器
-            val_loader: 验证数据加载器
-            epochs: 训练轮数
-            early_stopping_patience: 早停耐心值
-            save_best: 是否保存最佳模型
-        
-        Returns:
-            训练结果字典
+        完整训练流程（支持 Phase Training / Warmup / Cosine / 多指标早停）
         """
+        # 使用 advanced 中的 patience 覆盖外部传入值
+        patience = self.early_stop_patience if self.early_stop_patience is not None else early_stopping_patience
+        metric_key = self.early_stop_metric  # 'auc' | 'weighted_f1' | 'macro_f1' | 'macro_auc' | 'qwk'
+        # 指标键映射：metrics 字典中的键名
+        metric_map = {
+            'auc': 'auc',
+            'weighted_f1': 'f1',
+            'macro_f1': 'macro_f1',
+            'macro_auc': 'macro_auc',
+            'qwk': 'qwk',
+        }
+        monitor_key = metric_map.get(metric_key, 'auc')
+
         print(f"\n[TRAIN] 开始训练 {self.model_name}")
         print(f"[DATA] 训练样本: {len(train_loader.dataset)}")
         print(f"[DATA] 验证样本: {len(val_loader.dataset)}")
         print(f"[EPOCH] 训练轮数: {epochs}")
+        print(f"[EARLY_STOP] 监控指标: {metric_key} (patience={patience})")
+        if self.phase_training_enabled:
+            print(f"[PHASE] 渐进式训练: Phase1={self.phase_training_cfg.get('phase1_epochs', 20)} epochs")
         print("=" * 60)
-        
+
         start_time = time.time()
-        best_epoch = 0
+        start_epoch = 0
         patience_counter = 0
-        
-        for epoch in range(epochs):
+        best_epoch = 0
+
+        if self.train_history.get('loss'):
+            start_epoch = len(self.train_history['loss'])
+            print(f"[RESUME] 检测到训练历史，从 Epoch {start_epoch+1} 继续训练")
+            if self.val_history.get(monitor_key):
+                metric_history = self.val_history[monitor_key]
+                best_idx = int(np.argmax(metric_history))
+                self.best_val_metric = metric_history[best_idx]
+                patience_counter = len(metric_history) - 1 - best_idx
+                print(f"[RESUME] 重建 Patience: 当前 {patience_counter} / {patience} (最佳 {metric_key} 在 Epoch {best_idx+1})")
+
+        for epoch in range(start_epoch, epochs):
             epoch_start = time.time()
-            
+
+            # 渐进式训练：冻结/解冻参数
+            if self.phase_training_enabled:
+                self._apply_phase_training(epoch)
+
+            # Warmup（仅在 cosine 模式下，plateau 模式不启用 warmup）
+            if self.advanced_enabled and self.warmup_epochs > 0 and self.scheduler_type == 'cosine' and epoch < self.warmup_epochs:
+                for param_group in self.base_optimizer.param_groups:
+                    param_group['lr'] = self.base_lr * (epoch + 1) / self.warmup_epochs
+
             # 训练和验证
             train_metrics = self.train_epoch(train_loader)
             val_metrics = self.eval_epoch(val_loader)
-            
+
             # 学习率调度
-            self.scheduler.step(val_metrics['loss'])
-            
+            if self.scheduler_type == 'plateau':
+                self.scheduler.step(val_metrics['loss'])
+            elif self.scheduler_type == 'cosine':
+                # 跳过 warmup 阶段的 cosine step
+                if epoch >= self.warmup_epochs:
+                    self.scheduler.step()
+
+            # 辅助损失权重衰减
+            self._update_aux_weight(epoch)
+
             # 记录历史
             for key in self.train_history:
                 if key in train_metrics:
@@ -395,22 +870,32 @@ class EnhancedTrainer:
             for key in self.val_history:
                 if key in val_metrics:
                     self.val_history[key].append(val_metrics[key])
-            
-            # 记录模态权重（如果模型有 fusion_gate）
+
+            # 记录模态权重
             self._log_modality_gates(epoch)
-            
-            # 保存最佳模型
-            if val_metrics['auc'] > self.best_val_auc:
-                self.best_val_auc = val_metrics['auc']
+
+            # 保存最佳模型（按配置指标）
+            current_metric = val_metrics.get(monitor_key, -float('inf'))
+            # 若目标指标未计算（如某折缺少类别导致 macro_auc 为 nan），回退到 weighted_f1
+            if current_metric == -float('inf') or np.isnan(current_metric):
+                fallback_key = 'f1'
+                fallback_val = val_metrics.get(fallback_key, -float('inf'))
+                if not np.isnan(fallback_val):
+                    print(f"[WARN] {monitor_key} 不可用，回退到 {fallback_key} 作为早停指标")
+                    current_metric = fallback_val
+            if current_metric > self.best_val_metric:
+                self.best_val_metric = current_metric
                 best_epoch = epoch
                 patience_counter = 0
                 if save_best:
                     self.best_model_state = self.model.state_dict().copy()
+                    self.save_model("best_model.pt")
             else:
                 patience_counter += 1
-            
+
             # 打印进度
             epoch_time = time.time() - epoch_start
+            lr_display = self.base_optimizer.param_groups[0]["lr"] if hasattr(self, 'base_optimizer') else self.optimizer.param_groups[0]["lr"]
             print(f"Epoch {epoch+1:3d}/{epochs} | "
                   f"Train: Loss={train_metrics['loss']:.4f}, "
                   f"AUC={train_metrics['auc']:.4f}, "
@@ -418,37 +903,39 @@ class EnhancedTrainer:
                   f"Val: Loss={val_metrics['loss']:.4f}, "
                   f"AUC={val_metrics['auc']:.4f}, "
                   f"Acc={val_metrics['acc']:.4f} | "
-                  f"Time={epoch_time:.1f}s")
-            
+                  f"LR={lr_display:.2e} | Time={epoch_time:.1f}s")
+            sys.stdout.flush()
+
             # 早停检查
-            if patience_counter >= early_stopping_patience:
-                print(f"[STOP] 早停触发 (patience={early_stopping_patience})")
+            if patience_counter >= patience:
+                print(f"[STOP] 早停触发 (patience={patience}, 监控指标={metric_key})")
                 break
         
         # 训练完成
         total_time = time.time() - start_time
         print(f"\n[OK] 训练完成!")
         print(f"[TIME] 总时间: {total_time:.1f}s")
-        print(f"[BEST] 最佳验证AUC: {self.best_val_auc:.4f} (Epoch {best_epoch+1})")
-        
+        print(f"[BEST] 最佳验证{self.early_stop_metric.upper()}: {self.best_val_metric:.4f} (Epoch {best_epoch+1})")
+
         # 保存最佳模型
         if save_best and self.best_model_state is not None:
             self.model.load_state_dict(self.best_model_state)
             self.save_model()
-        
+
         # 生成可视化
         if self.enable_visualization:
             self._generate_training_visualizations()
-        
+
         # 保存模态权重历史到 JSON
         if self.modality_gate_history:
             gate_path = self.save_dir / "modality_gate_history.json"
             with gate_path.open("w", encoding="utf-8") as f:
                 json.dump(self.modality_gate_history, f, ensure_ascii=False, indent=2)
             print(f"[SAVE] 模态权重轨迹已保存到: {gate_path}")
-        
+
         return {
-            'best_val_auc': self.best_val_auc,
+            'best_val_auc': self.best_val_metric if self.early_stop_metric == 'auc' else (self.val_history.get('auc', [0])[-1] if self.val_history.get('auc') else 0.0),
+            'best_val_metric': self.best_val_metric,
             'best_epoch': best_epoch,
             'total_time': total_time,
             'train_history': self.train_history,
@@ -477,11 +964,12 @@ class EnhancedTrainer:
         all_preds = []
         all_labels = []
         all_probs = []
+        all_probs_full = []
         all_features = []
         all_attention_weights = []
-        
+
         with torch.no_grad():
-            for batch in tqdm(test_loader, desc="评估"):
+            for batch in tqdm(test_loader, desc="评估", file=sys.stdout):
                 # 数据准备
                 spectra = batch["spectra"].to(self.device)
                 tabular = batch["tabular"].to(self.device)
@@ -497,7 +985,7 @@ class EnhancedTrainer:
                 mask = batch.get("mask", None)
                 if not self.use_embedding_input and mask is not None:
                     mask = mask.to(self.device)
-                
+
                 # 前向传播
                 if not self.use_embedding_input:
                     # raw 模式：保持原有调用方式
@@ -519,22 +1007,26 @@ class EnhancedTrainer:
                 logits = outputs["logits"]
                 probs = torch.softmax(logits, dim=1)
                 preds = torch.argmax(logits, dim=1)
-                
+
                 # 收集结果
                 all_preds.extend(preds.detach().cpu().numpy())
                 all_labels.extend(labels.detach().cpu().numpy())
-                # 使用第 1 类的概率作为“正类”概率（多分类情况下在 _calculate_metrics 里会做 one-vs-rest 处理）
+                # 使用第 1 类的概率作为"正类"概率（多分类情况下在 _calculate_metrics 里会做 one-vs-rest 处理）
                 pos_prob = probs[:, 1] if probs.shape[1] > 1 else probs[:, 0]
                 all_probs.extend(pos_prob.detach().cpu().numpy())
-                
+                # 收集完整概率矩阵用于多类 Macro-AUC
+                if (self.compute_macro_auc or self.compute_weighted_auc) and probs.shape[1] > 1:
+                    all_probs_full.append(probs.detach().cpu().numpy())
+
                 # 收集特征和注意力权重
                 if 'embedding' in outputs:
                     all_features.append(outputs['embedding'].cpu().numpy())
                 if 'attention_weights' in outputs:
                     all_attention_weights.append(outputs['attention_weights'].cpu().numpy())
-        
+
         # 计算指标
-        metrics = self._calculate_metrics(all_labels, all_probs, all_preds)
+        probs_matrix = np.vstack(all_probs_full) if all_probs_full else None
+        metrics = self._calculate_metrics(all_labels, all_probs, all_preds, probs_matrix=probs_matrix)
         
         # 生成详细报告（兼容多分类情况）
         unique_labels = sorted(np.unique(all_labels))
@@ -911,9 +1403,11 @@ class EnhancedTrainer:
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'model_name': self.model_name,
-            'best_val_auc': self.best_val_auc,
+            'best_val_auc': getattr(self, 'best_val_metric', 0.0),
             'train_history': self.train_history,
-            'val_history': self.val_history
+            'val_history': self.val_history,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict()
         }, save_path)
         print(f"[SAVE] 模型已保存: {save_path}")
     
@@ -922,10 +1416,22 @@ class EnhancedTrainer:
         load_path = self.save_dir / filename
         if load_path.exists():
             checkpoint = torch.load(load_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.best_val_auc = checkpoint.get('best_val_auc', 0.0)
+            missing, unexpected = self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            if missing:
+                print(f"[WARN] 恢复模型时缺失键: {missing}")
+            if unexpected:
+                print(f"[WARN] 恢复模型时出现意外键 (已忽略): {unexpected}")
+
+            loaded_best = checkpoint.get('best_val_auc', 0.0)
+            self.best_val_metric = loaded_best
             self.train_history = checkpoint.get('train_history', {'loss': [], 'acc': [], 'auc': [], 'f1': []})
             self.val_history = checkpoint.get('val_history', {'loss': [], 'acc': [], 'auc': [], 'f1': []})
+
+            if 'optimizer_state_dict' in checkpoint:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                
             print(f"[LOAD] 模型已加载: {load_path}")
         else:
             print(f"[ERROR] 模型文件不存在: {load_path}")
@@ -940,7 +1446,7 @@ class EnhancedTrainer:
             'total_parameters': total_params,
             'trainable_parameters': trainable_params,
             'model_size_mb': total_params * 4 / (1024 * 1024),  # 假设float32
-            'best_val_auc': self.best_val_auc,
+            'best_val_auc': getattr(self, 'best_val_metric', 0.0),
             'device': str(self.device)
         }
 
@@ -1038,12 +1544,37 @@ def _generate_comparison_plots(
     # ROC曲线比较
     plt.figure(figsize=(10, 8))
     for name, result in results.items():
-        y_true = result['predictions']['labels']
-        y_prob = result['predictions']['probabilities']
-        fpr, tpr, _ = roc_curve(y_true, y_prob)
+        y_true = np.asarray(result['predictions']['labels'])
+        y_prob = np.asarray(result['predictions']['probabilities'])
         auc = result['metrics']['auc']
-        plt.plot(fpr, tpr, label=f'{name} (AUC = {auc:.3f})', linewidth=2)
-    
+
+        try:
+            # 二分类：直接使用 roc_curve
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+            plt.plot(fpr, tpr, label=f'{name} (AUC = {auc:.3f})', linewidth=2)
+        except ValueError:
+            # 多分类：计算 OvR 宏平均 ROC
+            try:
+                from sklearn.preprocessing import label_binarize
+                classes = np.unique(y_true)
+                y_true_bin = label_binarize(y_true, classes=classes)
+                if y_prob.ndim == 1:
+                    y_prob = np.column_stack([1 - y_prob, y_prob])
+                # 确保概率列数与类别数匹配
+                if y_prob.shape[1] != len(classes):
+                    print(f"[WARN] {name} 概率维度 {y_prob.shape[1]} 与类别数 {len(classes)} 不匹配，跳过 ROC 曲线")
+                    continue
+                all_fpr = np.linspace(0, 1, 100)
+                mean_tpr = np.zeros_like(all_fpr)
+                for i in range(len(classes)):
+                    fpr_i, tpr_i, _ = roc_curve(y_true_bin[:, i], y_prob[:, i])
+                    mean_tpr += np.interp(all_fpr, fpr_i, tpr_i)
+                mean_tpr /= len(classes)
+                plt.plot(all_fpr, mean_tpr, label=f'{name} (macro AUC = {auc:.3f})', linewidth=2)
+            except Exception as e2:
+                print(f"[WARN] {name} ROC 曲线绘制失败: {e2}")
+                continue
+
     plt.plot([0, 1], [0, 1], 'k--', alpha=0.5)
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])

@@ -1,0 +1,125 @@
+# 完整原始配置（Raw 模式 + CPU）
+# 所有参数一目了然，不依赖 defaults 继承
+# 预计耗时：单折 1~2 小时/模型，5-Fold CV 4~8 小时
+
+experiment:
+  name: "diabetes_multimodal_raw"
+  description: "Raw 模式完整实验（CPU）"
+  random_seed: 42
+  device: "cpu"
+  output_dir: "results"
+
+data:
+  spectra_csv: data/spectra.csv
+  clinical_csv: data/clinical.csv
+  label_col: Group
+  max_scans: 180
+  use_embedding: false
+  spectrum_embedding_path: spectrum_dimension/diabetes_results/Light_CNN_MLP_features.csv
+  clinical_embedding_path: data/clinical.csv
+  scan_aggregation: "sequence"
+  train_val_test_ratio: [0.7, 0.15, 0.15]
+  preprocessing:
+    baseline_correction:
+      enabled: true
+      method: "AsLS"
+      lam: 1000000.0
+      p: 0.001
+      niter: 10
+    smoothing:
+      enabled: true
+      window: 11
+      polyorder: 2
+    normalization:
+      method: "SNV"
+  num_workers: 0
+
+model:
+  name: "AttentionMultimodal"
+  num_classes: 4
+  dropout: 0.1
+  spec_emb: 256
+  tab_emb: 128
+  fusion: cross
+  num_attention_heads: 8
+  hidden_dims: [256, 128]
+  mmtm_bottleneck: 128
+  fusion_strategy: hierarchical
+  enable_uncertainty: true
+
+train:
+  epochs: 60
+  batch_size: 8
+  lr: 0.001
+  weight_decay: 1e-4
+  patience: 15
+  early_stopping_patience: 15
+  use_class_weights: false
+  use_augmentation: false
+  modality_dropout:
+    spectra: 0.15
+    clinical: 0.10
+  save_dir: results
+  save_prefix: model
+  advanced:
+    enabled: false
+    loss_type: "CE"
+    focal_gamma: 2.0
+    label_smoothing: 0.0
+    aux_weight: 1.0
+    optimizer: "AdamW"
+    scheduler_type: "plateau"
+    warmup_epochs: 0
+    grad_clip_max_norm: null
+    early_stop_metric: "auc"
+    early_stop_patience: 15
+
+evaluation:
+  metrics:
+    compute_macro_auc: true
+    compute_weighted_auc: true
+    compute_cohens_kappa: true
+    compute_qwk: true
+  cross_validation:
+    enabled: false
+    n_splits: 5
+    shuffle: true
+    random_state: 42
+    inner_val_ratio: 0.15
+  statistical_test:
+    enabled: false
+    alpha: 0.05
+    metric_for_comparison: "macro_auc"
+
+visualization:
+  enable: true
+  save_plots: true
+  plot_format: png
+  dpi: 300
+
+interpretability:
+  enable: true
+  shap_analysis: true
+  shap_background_samples: 10
+  shap_explanation_samples: 5
+  attention_analysis: true
+  pca_analysis: true
+  tsne_analysis: true
+
+comparison:
+  enable: true
+
+logging:
+  level: INFO
+  save_logs: true
+  log_file: training.log
+
+device:
+  use_cuda: false
+  cuda_device: 0
+  mixed_precision: false
+
+models_to_train:
+  - AttentionMultimodal
+  - ConcatFusion
+  - TFTMultimodal

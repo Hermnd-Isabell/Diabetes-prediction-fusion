@@ -1,4 +1,5 @@
 from typing import Dict, Any, List
+from collections import Counter
 
 import numpy as np
 import torch
@@ -23,16 +24,22 @@ class EmbeddingMultimodalDataset(Dataset):
 	本 Dataset 只做张量封装与切分，不做任何标准化或额外处理。
 	"""
 
-	def __init__(self, aligned: Dict[str, Dict[str, Any]], split: str, dropout_config: Dict[str, float] = None):
+	def __init__(self, aligned: Dict[str, Dict[str, Any]], split: str, dropout_config: Dict[str, float] = None,
+	             embedding_audit: Dict[str, Any] = None):
 		"""
 		Args:
 			aligned: 按 patient 对齐的 embedding 字典
 			split: 选择的划分 ("train" / "val" / "test")
 			dropout_config: 模态 dropout 配置 {"spectra": float, "clinical": float}，默认两者为 0.0
+			embedding_audit: embedding 生成审计配置 {"generation_scope": str, "generation_log": str}
 		"""
 		self.split = split
 		self.items: List[Dict[str, Any]] = []
-		
+
+		# Embedding 信息泄漏审计
+		if embedding_audit is not None:
+			self._run_embedding_audit(aligned, embedding_audit)
+
 		# 模态 dropout 配置（仅在训练时使用，验证/测试集应设为 0）
 		if dropout_config is None:
 			dropout_config = {"spectra": 0.0, "clinical": 0.0}
@@ -92,6 +99,36 @@ class EmbeddingMultimodalDataset(Dataset):
 					"has_tabular": has_tabular,
 					"label": label,
 				}
+			)
+
+	def _run_embedding_audit(self, aligned: Dict[str, Dict[str, Any]], audit_cfg: Dict[str, Any]):
+		"""执行 embedding 信息泄漏审计：检查 split 列是否存在及分布是否合理。"""
+		# 检查 split 列
+		has_split = any("split" in entry for entry in aligned.values())
+		if not has_split:
+			print(
+				"WARNING: Embedding CSV lacks 'split' column. Cannot verify train/val/test isolation. "
+				"Please ensure embeddings were generated using train-set-only fit."
+			)
+			return
+
+		# 校验 split 分布
+		splits = [entry.get("split") for entry in aligned.values() if "split" in entry]
+		split_counts = Counter(splits)
+		total = sum(split_counts.values())
+		if total == 0:
+			print("WARNING: Embedding data has no valid split entries.")
+			return
+
+		for sp in ["train", "val", "test"]:
+			if sp not in split_counts or split_counts[sp] == 0:
+				print(f"WARNING: Split '{sp}' has 0 samples in embedding data. Check data integrity.")
+
+		test_ratio = split_counts.get("test", 0) / total
+		if not (0.05 <= test_ratio <= 0.50):
+			print(
+				f"WARNING: Test split ratio ({test_ratio:.2%}) in embedding data is unusual. "
+				f"Expected roughly 10%-30%. Current distribution: {dict(split_counts)}"
 			)
 
 	def __len__(self) -> int:

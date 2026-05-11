@@ -1,0 +1,28 @@
+# Enhanced MMTM Model Configuration
+# 继承 experiment_base.yaml，仅覆盖 MMTM 差异化参数
+
+defaults:
+  - experiment_base
+
+experiment:
+  name: "mmtm_experiment"
+  description: "Enhanced MMTM Multimodal Model Experiment"
+  tags: [multimodal, mmtm, fusion]
+
+data:
+  max_scans: 64
+
+model:
+  name: EnhancedMMTM
+  spec_emb: 64
+  tab_emb: 64
+  mmtm_bottleneck: 32
+
+train:
+  batch_size: 4
+  lr: 0.0005
+  early_stopping_patience: 20
+  save_prefix: mmtm_model
+
+logging:
+  log_file: mmtm_training.log

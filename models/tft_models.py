@@ -7,20 +7,28 @@ import math
 # Enhanced Spectral TFT Encoder with Residual Connections
 # ----------------------------
 class SpectraTFTEncoder(nn.Module):
-    def __init__(self, input_dim=1, d_model=256, nhead=8, num_layers=3, dropout=0.1, seq_len=1024):
+    def __init__(self, input_dim=1, d_model=256, nhead=8, num_layers=3, dropout=0.1, seq_len=1024, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            d_model = self.lite_cfg.get("d_model", 64)
+            nhead = self.lite_cfg.get("nhead", 2)
+            num_layers = self.lite_cfg.get("num_layers", 1)
+            dropout = self.lite_cfg.get("dropout", 0.3)
+        self.d_model = d_model
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.LayerNorm(d_model),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
-        
+
         # Enhanced transformer with residual connections
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dropout=dropout, 
+            d_model=d_model,
+            nhead=nhead,
+            dropout=dropout,
             batch_first=True,
             activation='gelu'  # Better activation for transformers
         )
@@ -80,13 +88,18 @@ class SpectraTFTEncoder(nn.Module):
 # Enhanced Clinical Encoder with Feature Selection
 # ----------------------------
 class TabularStaticEncoder(nn.Module):
-    def __init__(self, in_dim, emb_dim=128, dropout=0.1):
+    def __init__(self, in_dim, emb_dim=128, dropout=0.1, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            emb_dim = self.lite_cfg.get("tab_emb", 16)
+            dropout = self.lite_cfg.get("dropout", 0.3)
         self.feature_selector = nn.Sequential(
             nn.Linear(in_dim, in_dim),
             nn.Sigmoid()  # Feature importance weights
         )
-        
+
         self.net = nn.Sequential(
             nn.Linear(in_dim, emb_dim * 2),
             nn.LayerNorm(emb_dim * 2),
@@ -111,11 +124,17 @@ class TabularStaticEncoder(nn.Module):
 # Cross-Modal Attention Mechanism
 # ----------------------------
 class CrossModalAttention(nn.Module):
-    def __init__(self, spec_dim, tab_dim, d_model=256, nhead=8, dropout=0.1):
+    def __init__(self, spec_dim, tab_dim, d_model=256, nhead=8, dropout=0.1, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            d_model = self.lite_cfg.get("fusion_dim", 64)
+            nhead = self.lite_cfg.get("nhead", 2)
+            dropout = self.lite_cfg.get("dropout", 0.3)
         self.spec_proj = nn.Linear(spec_dim, d_model)
         self.tab_proj = nn.Linear(tab_dim, d_model)
-        
+
         # Cross-attention layers
         self.spec_to_tab_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.tab_to_spec_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
@@ -171,8 +190,13 @@ class CrossModalAttention(nn.Module):
 # Enhanced Multi-Layer Gating Mechanism
 # ----------------------------
 class EnhancedGating(nn.Module):
-    def __init__(self, spec_dim, tab_dim, d_model=256, num_gates=3):
+    def __init__(self, spec_dim, tab_dim, d_model=256, num_gates=3, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            d_model = self.lite_cfg.get("fusion_dim", 64)
+            num_gates = 1
         self.num_gates = num_gates
         
         # Multiple gating layers
@@ -218,17 +242,24 @@ class EnhancedGating(nn.Module):
 # Enhanced TFT Multimodal Model with Advanced Fusion
 # ----------------------------
 class TFTMultimodal(nn.Module):
-    def __init__(self, tab_dim, spec_len=1024, spec_emb=256, tab_emb=128, num_classes=2, 
-                 fusion_dim=256, dropout=0.1):
+    def __init__(self, tab_dim, spec_len=1024, spec_emb=256, tab_emb=128, num_classes=2,
+                 fusion_dim=256, dropout=0.1, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            spec_emb = self.lite_cfg.get("d_model", 64)
+            tab_emb = self.lite_cfg.get("tab_emb", 16)
+            fusion_dim = self.lite_cfg.get("fusion_dim", 64)
+            dropout = self.lite_cfg.get("dropout", 0.3)
         # Enhanced encoders
-        self.spec_encoder = SpectraTFTEncoder(input_dim=1, d_model=spec_emb, seq_len=spec_len, dropout=dropout)
-        self.tab_encoder = TabularStaticEncoder(tab_dim, emb_dim=tab_emb, dropout=dropout)
-        
+        self.spec_encoder = SpectraTFTEncoder(input_dim=1, d_model=spec_emb, seq_len=spec_len, dropout=dropout, lite_cfg=lite_cfg)
+        self.tab_encoder = TabularStaticEncoder(tab_dim, emb_dim=tab_emb, dropout=dropout, lite_cfg=lite_cfg)
+
         # Advanced fusion components
-        self.cross_attention = CrossModalAttention(spec_emb, tab_emb, d_model=fusion_dim, dropout=dropout)
-        self.enhanced_gating = EnhancedGating(spec_emb, tab_emb, d_model=fusion_dim)
-        
+        self.cross_attention = CrossModalAttention(spec_emb, tab_emb, d_model=fusion_dim, dropout=dropout, lite_cfg=lite_cfg)
+        self.enhanced_gating = EnhancedGating(spec_emb, tab_emb, d_model=fusion_dim, lite_cfg=lite_cfg)
+
         # Multi-level fusion
         # 第一个层：输入是 [B, fusion_dim * 2]，输出是 [B, fusion_dim]
         # 第二个层：输入是 [B, fusion_dim]，输出是 [B, fusion_dim]
@@ -246,37 +277,49 @@ class TFTMultimodal(nn.Module):
                 nn.Dropout(dropout)
             )
         ])
-        
+
         # Enhanced classifier with auxiliary outputs
-        self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, fusion_dim),
-            nn.LayerNorm(fusion_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(fusion_dim, fusion_dim // 2),
-            nn.LayerNorm(fusion_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(fusion_dim // 2, num_classes)
-        )
-        
-        # Auxiliary classifiers for intermediate supervision
-        self.aux_classifier_spec = nn.Sequential(
-            nn.Linear(spec_emb, spec_emb // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(spec_emb // 2, num_classes)
-        )
-        
-        self.aux_classifier_tab = nn.Sequential(
-            nn.Linear(tab_emb, tab_emb // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(tab_emb // 2, num_classes)
-        )
-        
+        if self.is_lite:
+            cls_dims = self.lite_cfg.get("classifier_dims", [64, 32])
+            self.classifier = nn.Sequential(
+                nn.Linear(fusion_dim, cls_dims[0]),
+                nn.LayerNorm(cls_dims[0]),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(cls_dims[0], num_classes)
+            )
+            self.aux_classifier_spec = nn.Linear(spec_emb, num_classes)
+            self.aux_classifier_tab = nn.Linear(tab_emb, num_classes)
+        else:
+            self.classifier = nn.Sequential(
+                nn.Linear(fusion_dim, fusion_dim),
+                nn.LayerNorm(fusion_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(fusion_dim, fusion_dim // 2),
+                nn.LayerNorm(fusion_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(fusion_dim // 2, num_classes)
+            )
+
+            # Auxiliary classifiers for intermediate supervision
+            self.aux_classifier_spec = nn.Sequential(
+                nn.Linear(spec_emb, spec_emb // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(spec_emb // 2, num_classes)
+            )
+
+            self.aux_classifier_tab = nn.Sequential(
+                nn.Linear(tab_emb, tab_emb // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(tab_emb // 2, num_classes)
+            )
+
         # Attention-based scan pooling
-        self.scan_attention = nn.MultiheadAttention(spec_emb, num_heads=8, dropout=dropout, batch_first=True)
+        self.scan_attention = nn.MultiheadAttention(spec_emb, num_heads=(8 if not self.is_lite else self.lite_cfg.get("nhead", 2)), dropout=dropout, batch_first=True)
         self.scan_query = nn.Parameter(torch.randn(1, 1, spec_emb))
 
     def forward(self, *args):
@@ -455,22 +498,24 @@ class TFTMultimodal(nn.Module):
             aux_tab_input = tab_emb
         
         # 确保 aux_classifier 的输入维度正确
-        if aux_spec_input.shape[-1] == self.aux_classifier_spec[0].in_features:
+        aux_spec_in_features = self.aux_classifier_spec.in_features if isinstance(self.aux_classifier_spec, nn.Linear) else self.aux_classifier_spec[0].in_features
+        if aux_spec_input.shape[-1] == aux_spec_in_features:
             aux_logits_spec = self.aux_classifier_spec(aux_spec_input)  # [B, num_classes]
         else:
             # 如果维度不匹配，创建动态投影层
             if not hasattr(self, "_aux_proj_spec"):
-                self._aux_proj_spec = nn.Linear(aux_spec_input.shape[-1], self.aux_classifier_spec[0].in_features)
+                self._aux_proj_spec = nn.Linear(aux_spec_input.shape[-1], aux_spec_in_features)
                 self._aux_proj_spec = self._aux_proj_spec.to(aux_spec_input.device)
                 self.add_module("_aux_proj_spec", self._aux_proj_spec)
             aux_logits_spec = self.aux_classifier_spec(self._aux_proj_spec(aux_spec_input))
-        
-        if aux_tab_input.shape[-1] == self.aux_classifier_tab[0].in_features:
+
+        aux_tab_in_features = self.aux_classifier_tab.in_features if isinstance(self.aux_classifier_tab, nn.Linear) else self.aux_classifier_tab[0].in_features
+        if aux_tab_input.shape[-1] == aux_tab_in_features:
             aux_logits_tab = self.aux_classifier_tab(aux_tab_input)     # [B, num_classes]
         else:
             # 如果维度不匹配，创建动态投影层
             if not hasattr(self, "_aux_proj_tab"):
-                self._aux_proj_tab = nn.Linear(aux_tab_input.shape[-1], self.aux_classifier_tab[0].in_features)
+                self._aux_proj_tab = nn.Linear(aux_tab_input.shape[-1], aux_tab_in_features)
                 self._aux_proj_tab = self._aux_proj_tab.to(aux_tab_input.device)
                 self.add_module("_aux_proj_tab", self._aux_proj_tab)
             aux_logits_tab = self.aux_classifier_tab(self._aux_proj_tab(aux_tab_input))
@@ -505,10 +550,14 @@ class TFTLoss(nn.Module):
         """
         Contrastive loss to encourage similar embeddings for same class
         """
+        # Embedding 模式下光谱与临床维度常不一致（如 128 vs 79），跳过对比损失
+        if spec_emb.shape[-1] != tab_emb.shape[-1]:
+            return torch.tensor(0.0, device=spec_emb.device, requires_grad=False)
+
         # Normalize embeddings
         spec_emb = F.normalize(spec_emb, p=2, dim=1)
         tab_emb = F.normalize(tab_emb, p=2, dim=1)
-        
+
         # Compute similarity matrix
         similarity = torch.matmul(spec_emb, tab_emb.T) / self.temperature
         

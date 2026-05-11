@@ -30,9 +30,13 @@ from typing import Dict, List, Optional, Tuple
 
 class MultiHeadCrossModalAttention(nn.Module):
     """多头跨模态注意力机制"""
-    
-    def __init__(self, spec_dim: int, tab_dim: int, num_heads: int = 8, dropout: float = 0.1):
+
+    def __init__(self, spec_dim: int, tab_dim: int, num_heads: int = 8, dropout: float = 0.1, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            num_heads = self.lite_cfg.get("num_attention_heads", 2)
         self.num_heads = num_heads
         self.spec_dim = spec_dim
         self.tab_dim = tab_dim
@@ -89,9 +93,13 @@ class MultiHeadCrossModalAttention(nn.Module):
 
 class AdaptiveGating(nn.Module):
     """自适应门控机制，支持温度缩放和动态权重"""
-    
-    def __init__(self, spec_dim: int, tab_dim: int, bottleneck_dim: int = 128):
+
+    def __init__(self, spec_dim: int, tab_dim: int, bottleneck_dim: int = 128, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            bottleneck_dim = self.lite_cfg.get("bottleneck_dim", 32)
         self.spec_dim = spec_dim
         self.tab_dim = tab_dim
         self.bottleneck_dim = bottleneck_dim
@@ -109,18 +117,27 @@ class AdaptiveGating(nn.Module):
         )
         
         # 交互网络 - 更深的结构
-        self.interaction_net = nn.Sequential(
-            nn.Linear(bottleneck_dim * 2, bottleneck_dim * 2),
-            nn.LayerNorm(bottleneck_dim * 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(bottleneck_dim * 2, bottleneck_dim),
-            nn.LayerNorm(bottleneck_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(bottleneck_dim, bottleneck_dim // 2),
-            nn.ReLU()
-        )
+        if self.is_lite:
+            self.interaction_net = nn.Sequential(
+                nn.Linear(bottleneck_dim * 2, bottleneck_dim),
+                nn.LayerNorm(bottleneck_dim),
+                nn.ReLU(),
+                nn.Linear(bottleneck_dim, bottleneck_dim // 2),
+                nn.ReLU(),
+            )
+        else:
+            self.interaction_net = nn.Sequential(
+                nn.Linear(bottleneck_dim * 2, bottleneck_dim * 2),
+                nn.LayerNorm(bottleneck_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(bottleneck_dim * 2, bottleneck_dim),
+                nn.LayerNorm(bottleneck_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(bottleneck_dim, bottleneck_dim // 2),
+                nn.ReLU()
+            )
         
         # 门控生成器
         self.gate_spec = nn.Sequential(
@@ -187,12 +204,18 @@ class AdaptiveGating(nn.Module):
 
 class HierarchicalFusion(nn.Module):
     """层次化融合策略"""
-    
-    def __init__(self, spec_dim: int, tab_dim: int, num_scales: int = 3):
+
+    def __init__(self, spec_dim: int, tab_dim: int, num_scales: int = 3, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            scales = self.lite_cfg.get("scales", ["global"])
+            self.num_scales = len(scales)
+        else:
+            self.num_scales = num_scales
         self.spec_dim = spec_dim
         self.tab_dim = tab_dim
-        self.num_scales = num_scales
         
         # 多尺度投影
         self.spec_scales = nn.ModuleList([
@@ -248,39 +271,51 @@ class HierarchicalFusion(nn.Module):
 
 class AdvancedClassifier(nn.Module):
     """高级分类器，带残差连接和不确定性估计"""
-    
-    def __init__(self, input_dim: int, num_classes: int, hidden_dims: List[int] = None):
+
+    def __init__(self, input_dim: int, num_classes: int, hidden_dims: List[int] = None, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
         if hidden_dims is None:
             hidden_dims = [input_dim // 2, input_dim // 4]
-        
+        if self.is_lite:
+            hidden_dims = self.lite_cfg.get("classifier_dims", [max(input_dim // 2, 16), max(input_dim // 4, 8)])
+            dropout = self.lite_cfg.get("dropout", 0.3)
+            self.use_uncertainty = self.lite_cfg.get("enable_uncertainty", False)
+        else:
+            dropout = 0.2
+            self.use_uncertainty = True
+
         self.num_classes = num_classes
-        
+
         # 构建残差块
         layers = []
         prev_dim = input_dim
-        
+
         for hidden_dim in hidden_dims:
             layers.extend([
                 nn.Linear(prev_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.ReLU(),
-                nn.Dropout(0.2)
+                nn.Dropout(dropout)
             ])
             prev_dim = hidden_dim
-        
+
         self.feature_extractor = nn.Sequential(*layers)
-        
+
         # 主分类头
         self.classifier = nn.Linear(prev_dim, num_classes)
-        
+
         # 不确定性估计头
-        self.uncertainty_head = nn.Sequential(
-            nn.Linear(prev_dim, prev_dim // 2),
-            nn.ReLU(),
-            nn.Linear(prev_dim // 2, 1),
-            nn.Softplus()  # 确保输出为正
-        )
+        if self.use_uncertainty:
+            self.uncertainty_head = nn.Sequential(
+                nn.Linear(prev_dim, prev_dim // 2),
+                nn.ReLU(),
+                nn.Linear(prev_dim // 2, 1),
+                nn.Softplus()  # 确保输出为正
+            )
+        else:
+            self.uncertainty_head = None
         
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -292,28 +327,36 @@ class AdvancedClassifier(nn.Module):
         """
         features = self.feature_extractor(x)
         logits = self.classifier(features)
-        uncertainty = self.uncertainty_head(features)
-        
+        if self.uncertainty_head is not None:
+            uncertainty = self.uncertainty_head(features)
+        else:
+            uncertainty = torch.zeros(logits.size(0), 1, device=logits.device)
+
         return logits, uncertainty
 
 
 class EnhancedMMTM(nn.Module):
     """增强版MMTM模块"""
-    
-    def __init__(self, spec_dim: int, tab_dim: int, bottleneck_dim: int = 128, 
-                 num_attention_heads: int = 8):
+
+    def __init__(self, spec_dim: int, tab_dim: int, bottleneck_dim: int = 128,
+                 num_attention_heads: int = 8, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            bottleneck_dim = self.lite_cfg.get("bottleneck_dim", 32)
+            num_attention_heads = self.lite_cfg.get("num_attention_heads", 2)
         self.spec_dim = spec_dim
         self.tab_dim = tab_dim
-        
+
         # 多头注意力
         self.attention = MultiHeadCrossModalAttention(
-            spec_dim, tab_dim, num_attention_heads
+            spec_dim, tab_dim, num_attention_heads, lite_cfg=lite_cfg
         )
-        
+
         # 自适应门控
-        self.adaptive_gating = AdaptiveGating(spec_dim, tab_dim, bottleneck_dim)
-        
+        self.adaptive_gating = AdaptiveGating(spec_dim, tab_dim, bottleneck_dim, lite_cfg=lite_cfg)
+
     def forward(self, spec_vec: torch.Tensor, tab_vec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         Args:
@@ -326,10 +369,10 @@ class EnhancedMMTM(nn.Module):
         """
         # 1. 多头注意力增强
         spec_attn, tab_attn = self.attention(spec_vec, tab_vec)
-        
+
         # 2. 自适应门控
         spec_gated, tab_gated, gating_info = self.adaptive_gating(spec_attn, tab_attn)
-        
+
         return spec_gated, tab_gated, {
             'attention_spec': spec_attn,
             'attention_tab': tab_attn,
@@ -339,11 +382,11 @@ class EnhancedMMTM(nn.Module):
 
 class EnhancedMMTMFusion(nn.Module):
     """增强版MMTM融合模型"""
-    
-    def __init__(self, spec_embedding_dim: int = 256, tab_embedding_dim: int = 128, 
-                 num_classes: int = 2, mmtm_bottleneck: int = 128, 
+
+    def __init__(self, spec_embedding_dim: int = 256, tab_embedding_dim: int = 128,
+                 num_classes: int = 2, mmtm_bottleneck: int = 128,
                  num_attention_heads: int = 8, fusion_strategy: str = 'hierarchical',
-                 enable_uncertainty: bool = True):
+                 enable_uncertainty: bool = True, tab_input_dim: int = 10, lite_cfg=None):
         """
         Args:
             spec_embedding_dim: 光谱嵌入维度
@@ -353,103 +396,162 @@ class EnhancedMMTMFusion(nn.Module):
             num_attention_heads: 注意力头数（如果维度不匹配，会自动调整）
             fusion_strategy: 融合策略 ('hierarchical', 'concat', 'interaction')
             enable_uncertainty: 是否启用不确定性估计
+            tab_input_dim: 表格输入特征维度 (default: 10)
         """
         super().__init__()
-        self.spec_embedding_dim = spec_embedding_dim
-        self.tab_embedding_dim = tab_embedding_dim
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            self.actual_spec_dim = spec_embedding_dim
+            self.actual_tab_dim = tab_embedding_dim
+            self.spec_embedding_dim = self.lite_cfg.get("spec_emb", 32)
+            self.tab_embedding_dim = self.lite_cfg.get("tab_emb", 16)
+            self.spec_input_proj = nn.Linear(self.actual_spec_dim, self.spec_embedding_dim)
+            self.tab_input_proj = nn.Linear(self.actual_tab_dim, self.tab_embedding_dim)
+            mmtm_bottleneck = self.lite_cfg.get("bottleneck_dim", 32)
+            num_attention_heads = self.lite_cfg.get("num_attention_heads", 2)
+            fusion_strategy = self.lite_cfg.get("fusion_strategy", fusion_strategy)
+            enable_uncertainty = self.lite_cfg.get("enable_uncertainty", False)
+        else:
+            self.actual_spec_dim = spec_embedding_dim
+            self.actual_tab_dim = tab_embedding_dim
+            self.spec_input_proj = None
+            self.tab_input_proj = None
+            self.spec_embedding_dim = spec_embedding_dim
+            self.tab_embedding_dim = tab_embedding_dim
+
+        self.tab_input_dim = tab_input_dim
         self.fusion_strategy = fusion_strategy
+
         self.enable_uncertainty = enable_uncertainty
-        
+
         # 自动调整 num_attention_heads，使其能同时整除 spec_dim 和 tab_dim
         adjusted_num_heads = self._adjust_num_heads(
-            spec_embedding_dim, tab_embedding_dim, num_attention_heads
+            self.spec_embedding_dim, self.tab_embedding_dim, num_attention_heads
         )
         if adjusted_num_heads != num_attention_heads:
             print(f"[WARN] 自动调整注意力头数: {num_attention_heads} -> {adjusted_num_heads} "
-                  f"(因为 tab_dim={tab_embedding_dim} 和 spec_dim={spec_embedding_dim} 不能被 {num_attention_heads} 整除)")
-        
+                  f"(因为 tab_dim={self.tab_embedding_dim} 和 spec_dim={self.spec_embedding_dim} 不能被 {num_attention_heads} 整除)")
+
         # 增强版MMTM
         self.enhanced_mmtm = EnhancedMMTM(
-            spec_dim=spec_embedding_dim,
-            tab_dim=tab_embedding_dim,
+            spec_dim=self.spec_embedding_dim,
+            tab_dim=self.tab_embedding_dim,
             bottleneck_dim=mmtm_bottleneck,
-            num_attention_heads=adjusted_num_heads
+            num_attention_heads=adjusted_num_heads,
+            lite_cfg=lite_cfg
         )
-        
+
         # 融合策略
         if fusion_strategy == 'hierarchical':
-            self.fusion_module = HierarchicalFusion(spec_embedding_dim, tab_embedding_dim)
+            self.fusion_module = HierarchicalFusion(self.spec_embedding_dim, self.tab_embedding_dim, lite_cfg=lite_cfg)
             # 计算融合后的维度
             fused_dim = self._calculate_hierarchical_fusion_dim()
         elif fusion_strategy == 'concat':
-            if spec_embedding_dim == tab_embedding_dim:
-                fused_dim = spec_embedding_dim * 3
+            if self.spec_embedding_dim == self.tab_embedding_dim:
+                fused_dim = self.spec_embedding_dim * 3
             else:
-                self.tab_to_spec_proj = nn.Linear(tab_embedding_dim, spec_embedding_dim)
-                fused_dim = spec_embedding_dim * 3
+                self.tab_to_spec_proj = nn.Linear(self.tab_embedding_dim, self.spec_embedding_dim)
+                fused_dim = self.spec_embedding_dim * 3
         else:  # interaction
-            if spec_embedding_dim == tab_embedding_dim:
-                fused_dim = spec_embedding_dim
+            if self.spec_embedding_dim == self.tab_embedding_dim:
+                fused_dim = self.spec_embedding_dim
             else:
-                self.tab_to_spec_proj = nn.Linear(tab_embedding_dim, spec_embedding_dim)
-                fused_dim = spec_embedding_dim
-        
+                self.tab_to_spec_proj = nn.Linear(self.tab_embedding_dim, self.spec_embedding_dim)
+                fused_dim = self.spec_embedding_dim
+
         # 高级分类器
         self.classifier = AdvancedClassifier(
             input_dim=fused_dim,
             num_classes=num_classes,
-            hidden_dims=[fused_dim // 2, fused_dim // 4]
+            hidden_dims=[fused_dim // 2, fused_dim // 4],
+            lite_cfg=lite_cfg
         )
-        
+
         # 添加内部编码器，用于处理原始输入
         self.internal_spec_encoder = self._build_spectral_encoder()
         self.internal_tab_encoder = self._build_tabular_encoder()
-        self.internal_spec_classifier = nn.Linear(spec_embedding_dim, num_classes)
-        self.internal_tab_classifier = nn.Linear(tab_embedding_dim, num_classes)
+        self.internal_spec_classifier = nn.Linear(self.spec_embedding_dim, num_classes)
+        self.internal_tab_classifier = nn.Linear(self.tab_embedding_dim, num_classes)
     
     def _build_spectral_encoder(self):
         """构建内部光谱编码器"""
-        return nn.Sequential(
-            # 扫描级特征提取
-            nn.Conv1d(1, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),  # 全局平均池化
-            nn.Flatten(),
-            nn.Linear(256, self.spec_embedding_dim),
-            nn.LayerNorm(self.spec_embedding_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-    
+        if self.is_lite:
+            channels = self.lite_cfg.get("cnn_channels", [8, 16, 8])
+            dropout = self.lite_cfg.get("dropout", 0.3)
+            return nn.Sequential(
+                nn.Conv1d(1, channels[0], kernel_size=7, padding=3),
+                nn.BatchNorm1d(channels[0]),
+                nn.ReLU(),
+                nn.Conv1d(channels[0], channels[1], kernel_size=5, padding=2),
+                nn.BatchNorm1d(channels[1]),
+                nn.ReLU(),
+                nn.Conv1d(channels[1], channels[2], kernel_size=3, padding=1),
+                nn.BatchNorm1d(channels[2]),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(channels[2], self.spec_embedding_dim),
+                nn.LayerNorm(self.spec_embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+        else:
+            return nn.Sequential(
+                # 扫描级特征提取
+                nn.Conv1d(1, 64, kernel_size=7, padding=3),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Conv1d(64, 128, kernel_size=5, padding=2),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Conv1d(128, 256, kernel_size=3, padding=1),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),  # 全局平均池化
+                nn.Flatten(),
+                nn.Linear(256, self.spec_embedding_dim),
+                nn.LayerNorm(self.spec_embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
+
     def _build_tabular_encoder(self):
         """构建内部表格编码器"""
-        return nn.Sequential(
-            nn.Linear(10, 256),  # 假设表格特征维度为10
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, self.tab_embedding_dim),
-            nn.LayerNorm(self.tab_embedding_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        
+        if self.is_lite:
+            h = self.lite_cfg.get("hidden_dim", 32)
+            dropout = self.lite_cfg.get("dropout", 0.3)
+            return nn.Sequential(
+                nn.Linear(self.tab_input_dim, h),
+                nn.LayerNorm(h),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(h, self.tab_embedding_dim),
+                nn.LayerNorm(self.tab_embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+        else:
+            return nn.Sequential(
+                nn.Linear(self.tab_input_dim, 256),  # 使用动态输入的维度
+                nn.LayerNorm(256),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(256, self.tab_embedding_dim),
+                nn.LayerNorm(self.tab_embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
+
     def _adjust_num_heads(self, spec_dim: int, tab_dim: int, requested_heads: int) -> int:
         """
         自动调整注意力头数，使其能同时整除 spec_dim 和 tab_dim
-        
+
         Args:
             spec_dim: 光谱维度
             tab_dim: 表格维度
             requested_heads: 用户请求的头数
-        
+
         Returns:
             调整后的头数（能同时整除两个维度，且不超过 requested_heads）
         """
@@ -458,14 +560,15 @@ class EnhancedMMTMFusion(nn.Module):
         for num_heads in range(requested_heads, 0, -1):
             if spec_dim % num_heads == 0 and tab_dim % num_heads == 0:
                 return num_heads
-        
+
         # 如果找不到，返回 1（单个头总是可以工作的）
         return 1
-    
+
     def _calculate_hierarchical_fusion_dim(self) -> int:
         """计算层次化融合后的维度"""
         total_dim = 0
-        for i in range(3):  # num_scales = 3
+        num_scales = 1 if self.is_lite else 3
+        for i in range(num_scales):
             spec_scale_dim = self.spec_embedding_dim // (2**i)
             tab_scale_dim = self.tab_embedding_dim // (2**i)
             min_dim = min(spec_scale_dim, tab_scale_dim)
@@ -487,6 +590,8 @@ class EnhancedMMTMFusion(nn.Module):
 
             # ===== Soft Gating for Missing Modality =====
             spec_emb = spectra_result['embedding']
+            if self.spec_input_proj is not None:
+                spec_emb = self.spec_input_proj(spec_emb)
             spec_mask = spectra_result.get('mask', None)
             if spec_mask is not None:
                 m = spec_mask.unsqueeze(-1).float()  # [B,1]
@@ -498,6 +603,8 @@ class EnhancedMMTMFusion(nn.Module):
                 spec_emb = spec_emb * m + (1 - m) * self._soft_gate_default_spec
 
             tab_emb = tabular_result['embedding']
+            if self.tab_input_proj is not None:
+                tab_emb = self.tab_input_proj(tab_emb)
             tab_mask = tabular_result.get('mask', None)
             if tab_mask is not None:
                 m = tab_mask.unsqueeze(-1).float()  # [B,1]

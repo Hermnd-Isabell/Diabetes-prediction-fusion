@@ -80,14 +80,31 @@ def main():
 	# 更新pipeline中的模型
 	pipe.named_steps['model'] = model
 
-	# 评估测试集
-	proba = pipe.predict_proba(X_test)[:, 1]
-	y_pred = (proba >= 0.5).astype(int)
-	metrics = {
-		'auc': float(roc_auc_score(y_test, proba)),
-		'f1': float(f1_score(y_test, y_pred)),
-		'accuracy': float(accuracy_score(y_test, y_pred)),
-	}
+	# 评估测试集（支持多分类）
+	proba = pipe.predict_proba(X_test)
+	y_pred = pipe.predict(X_test)
+	num_classes = len(cfg.allowed_labels)
+	if num_classes == 2:
+		# 二分类
+		metrics = {
+			'auc': float(roc_auc_score(y_test, proba[:, 1])),
+			'f1': float(f1_score(y_test, y_pred)),
+			'accuracy': float(accuracy_score(y_test, y_pred)),
+		}
+	else:
+		# 多分类
+		from sklearn.preprocessing import label_binarize
+		y_test_bin = label_binarize(y_test, classes=list(cfg.allowed_labels))
+		try:
+			macro_auc = float(roc_auc_score(y_test_bin, proba, multi_class='ovr', average='macro'))
+		except ValueError:
+			macro_auc = None
+		metrics = {
+			'macro_auc': macro_auc,
+			'f1_weighted': float(f1_score(y_test, y_pred, average='weighted')),
+			'f1_macro': float(f1_score(y_test, y_pred, average='macro')),
+			'accuracy': float(accuracy_score(y_test, y_pred)),
+		}
 	with open(cfg.output_dir / 'metrics.json', 'w', encoding='utf-8') as f:
 		json.dump(metrics, f, ensure_ascii=False, indent=2)
 	print('[train] 测试集指标:', metrics)

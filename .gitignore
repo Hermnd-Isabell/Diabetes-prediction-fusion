@@ -129,8 +129,29 @@ data/spectra.csv
 
 # Results and logs
 results/
+results_*/
 logs/
 *.log
+resume_log.txt
+
+# LightGBM outputs
+clinic_dimension/outputs*/
+
+# Temporary scripts and files
+*.ps1
+launch_cv.ps1
+task_output_debug.txt
+tft_error.txt
+debug_clinical_csv.py
+test_*.py
+nul
+
+# Excel temp files
+~$*
+
+# Data (large files)
+data/*.csv
+data/*.xlsx
 
 # IDE
 .vscode/

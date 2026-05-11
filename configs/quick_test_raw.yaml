@@ -1,0 +1,15 @@
+# 快速测试 Raw 模式（仅1 epoch）
+defaults:
+  - full_run_raw_cpu
+
+train:
+  epochs: 1
+  patience: 1
+  early_stopping_patience: 1
+
+evaluation:
+  cross_validation:
+    enabled: false
+
+models_to_train:
+  - AttentionMultimodal

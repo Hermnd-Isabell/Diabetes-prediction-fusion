@@ -1,0 +1,28 @@
+# TFT Multimodal Experiment Configuration
+# 继承 experiment_base.yaml，仅覆盖 TFT 差异化参数
+
+defaults:
+  - experiment_base
+
+experiment:
+  name: "tft_experiment"
+  description: "TFT Multimodal Model Experiment"
+  tags: [multimodal, tft, transformer]
+
+data:
+  max_scans: 64
+
+model:
+  name: TFTMultimodal
+  spec_emb: 64
+  tab_emb: 64
+  dropout: 0.3
+
+train:
+  batch_size: 4
+  lr: 0.0005
+  early_stopping_patience: 20
+  save_prefix: tft_model
+
+logging:
+  log_file: tft_training.log

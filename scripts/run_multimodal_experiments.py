@@ -1,286 +1,460 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多模型循环训练脚本
+标准化消融实验运行器（Standardized Experiment Orchestrator）
 
-一次性训练多个多模态模型，并汇总实验结果到 CSV 表格。
+支持多种运行模式：
+  single  -- 固定三分划分 + 多种子平均
+  cv      -- Stratified K-Fold 交叉验证
+  legacy  -- 与旧版行为完全一致（默认）
+
+支持统一 Lite 切换、基线补全、自动结果聚合。
 
 使用方法:
-    python scripts/run_multimodal_experiments.py --config configs/enhanced_config.yaml --embedding_only
-    python scripts/run_multimodal_experiments.py --config configs/enhanced_config.yaml --models AttentionMultimodal EnhancedMMTM
+  # 多种子单折（推荐用于 142 样本场景）
+  python scripts/run_multimodal_experiments.py \
+      --config configs/experiment_base.yaml \
+      --models SpectraOnlyModel ClinicalOnlyModel ConcatFusion EnsembleFusion BaselineMultimodal AttentionMultimodal TFTMultimodal EnhancedMMTM \
+      --mode single --seeds 0 1 2 3 4 --lite
+
+  # 5-Fold CV
+  python scripts/run_multimodal_experiments.py \
+      --config configs/experiment_base.yaml \
+      --models AttentionMultimodal \
+      --mode cv --n_splits 5 --lite
+
+  # 旧版行为（单种子、单折）
+  python scripts/run_multimodal_experiments.py \
+      --config configs/enhanced_config.yaml \
+      --models AttentionMultimodal EnhancedMMTM
 """
 
 import argparse
 import copy
 import json
 import sys
+import subprocess
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
+import numpy as np
 import pandas as pd
+import torch
+from sklearn.model_selection import StratifiedKFold
 
-# 确保可以从脚本所在目录的上一级（项目根目录）导入 enhanced_main
+# 确保可以从脚本所在目录的上一级导入
 THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = THIS_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# 导入 enhanced_main 中的函数
-try:
-    from enhanced_main import load_config, prepare_data, train_single_model
-except ImportError as e:
-    print(f"[ERROR] 无法导入 enhanced_main: {e}")
-    print("       请确认在项目根目录运行本脚本，或检查 enhanced_main.py 是否存在。")
-    sys.exit(1)
+from enhanced_main import load_config, prepare_data, train_single_model, build_model
+from datasets.raman_dataset import RamanDataset, collate_fn, preprocess_spectrum
+from datasets.embedding_dataset import EmbeddingMultimodalDataset, embedding_collate_fn
+from torch.utils.data import DataLoader, Subset
 
 
-# 默认要跑的模型列表
-# 注意：模型名称必须与 enhanced_main.py 中 build_model() 支持的名称一致
 DEFAULT_MODELS = [
-    "BaselineMultimodal",  # Baseline 多模态融合（默认使用 concat）
+    "SpectraOnlyModel",
+    "ClinicalOnlyModel",
+    "ConcatFusion",
+    "EnsembleFusion",
+    "BaselineMultimodal",
     "AttentionMultimodal",
+    "TFTMultimodal",
     "EnhancedMMTM",
-    # "ConcatFusion",      # Baseline 融合方式 1（可选）
-    # "EnsembleFusion",    # Baseline 融合方式 2（可选）
-    # "TFTMultimodal",    # 如需一起跑，取消注释
 ]
 
 
+def set_seed(seed: int):
+    """统一设置随机种子。"""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def try_load_metrics(model_dir: Path) -> Dict[str, Any]:
-    """
-    尝试从模型结果目录中加载指标 JSON。
-    兼容多种命名：results.json / metrics.json / best_metrics.json / metrics_summary.json
-    """
-    candidate_names = [
-        "metrics_summary.json",  # 优先读取统一格式
-        "results.json",
-        "metrics.json",
-        "best_metrics.json",
-    ]
-    
-    for name in candidate_names:
-        path = model_dir / name
-        if path.exists():
-            try:
-                with path.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-                return data
-            except Exception as e:
-                print(f"[WARN] 读取 {path} 时出错: {e}，尝试下一个文件")
-                continue
-    
-    print(f"[WARN] 未在 {model_dir} 中找到指标 JSON 文件（{candidate_names}），将仅记录模型名称。")
+    """从模型结果目录加载 metrics_summary.json。"""
+    path = model_dir / "metrics_summary.json"
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[WARN] 读取 {path} 时出错: {e}")
     return {}
 
 
-def extract_metrics_from_results(results_data: Dict[str, Any]) -> Dict[str, Any]:
+def run_single_seed(
+    cfg: dict,
+    model_name: str,
+    seed: int,
+    save_root: Path,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
     """
-    从 results.json 中提取关键指标，转换为统一格式。
+    对指定模型和种子执行一次单折训练。
+    返回 metrics_summary 字典（若已存在且未 overwrite 则直接读取）。
     """
-    metrics = {}
-    
-    # 从 training_result 中提取验证集最佳指标
-    if "training_result" in results_data:
-        train_res = results_data["training_result"]
-        metrics["best_val_auc"] = train_res.get("best_val_auc", None)
-        metrics["best_epoch"] = train_res.get("best_epoch", None)
-        metrics["total_time"] = train_res.get("total_time", None)
-        
-        # 从 val_history 中提取最后一个 epoch 的指标
-        if "val_history" in train_res:
-            val_hist = train_res["val_history"]
-            if val_hist.get("auc"):
-                metrics["final_val_auc"] = val_hist["auc"][-1] if val_hist["auc"] else None
-            if val_hist.get("acc"):
-                metrics["final_val_acc"] = val_hist["acc"][-1] if val_hist["acc"] else None
-            if val_hist.get("f1"):
-                metrics["final_val_f1"] = val_hist["f1"][-1] if val_hist["f1"] else None
-    
-    # 从 test_result 中提取测试集指标
-    if "test_result" in results_data and "metrics" in results_data["test_result"]:
-        test_metrics = results_data["test_result"]["metrics"]
-        metrics["test_auc"] = test_metrics.get("auc", None)
-        metrics["test_acc"] = test_metrics.get("acc", None)
-        metrics["test_f1"] = test_metrics.get("f1", None)
-        metrics["test_sensitivity@90%spec"] = test_metrics.get("sensitivity@90%spec", None)
-    
+    seed_dir = save_root / model_name / f"seed_{seed}"
+    metrics_path = seed_dir / "metrics_summary.json"
+
+    if seed_dir.exists() and metrics_path.exists() and not overwrite:
+        print(f"  [SKIP] {model_name} / seed={seed} 已存在，使用 --overwrite 强制重跑")
+        return try_load_metrics(seed_dir)
+
+    # 设置种子
+    set_seed(seed)
+    run_cfg = copy.deepcopy(cfg)
+    run_cfg.setdefault("experiment", {})
+    run_cfg["experiment"]["random_seed"] = seed
+    run_cfg["model"]["name"] = model_name
+    # 同步 save_dir，确保训练输出到正确的根目录
+    run_cfg.setdefault("train", {})
+    run_cfg["train"]["save_dir"] = str(save_root)
+
+    # 数据准备（seed 会影响 random_split）
+    train_loader, val_loader, test_loader, dataset_info = prepare_data(run_cfg)
+
+    # 训练
+    print(f"  [TRAIN] {model_name} | seed={seed}")
+    trainer = train_single_model(
+        run_cfg,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        dataset_info=dataset_info,
+        model_name=model_name,
+    )
+
+    # 将结果从 src_dir 复制到 seed_dir（仅复制 JSON/CSV/日志，.pt 文件可能较大且可能被占用）
+    src_dir = save_root / model_name
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    if src_dir.exists():
+        import shutil
+        for f in list(src_dir.iterdir()):
+            if f.is_file() and f.suffix in (".json", ".csv", ".txt", ".log"):
+                dst = seed_dir / f.name
+                if dst.exists():
+                    dst.unlink()
+                shutil.copy2(str(f), str(dst))
+
+    metrics = try_load_metrics(seed_dir)
+    metrics["seed"] = seed
     return metrics
 
 
-def run_experiments(
-    config_path: str,
-    model_names: List[str],
-    use_embedding_only: bool = False,
-) -> pd.DataFrame:
+def run_cv_fold(
+    cfg: dict,
+    model_name: str,
+    fold: int,
+    train_idx: List[int],
+    val_idx: List[int],
+    dataset,
+    save_root: Path,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
     """
-    使用统一的 config，循环跑多个模型，并汇总结果为 DataFrame。
+    执行一次 CV fold 训练。
     """
-    cfg = load_config(config_path)
-    
-    # 如果只想在 embedding 模式下跑实验，可以强制打开 use_embedding
-    if use_embedding_only:
-        cfg.setdefault("data", {})
-        cfg["data"]["use_embedding"] = True
-        print("[INFO] 强制启用 embedding 模式")
-    
-    # 数据只准备一次（前提是所有模型使用同一份数据设定）
-    print("\n" + "=" * 80)
-    print("[INFO] 准备数据集（所有模型共享）")
-    print("=" * 80)
-    train_loader, val_loader, test_loader, dataset_info = prepare_data(cfg)
-    
-    save_root = Path(cfg["train"].get("save_dir", "results"))
-    summary_rows: List[Dict[str, Any]] = []
-    
-    print(f"\n[INFO] 开始循环训练 {len(model_names)} 个模型")
-    print(f"[INFO] 结果将保存到: {save_root}")
-    
-    for idx, model_name in enumerate(model_names, 1):
-        print("\n" + "=" * 80)
-        print(f"[{idx}/{len(model_names)}] 开始训练模型: {model_name}")
+    fold_dir = save_root / model_name / f"fold_{fold}"
+    metrics_path = fold_dir / "metrics_summary.json"
+
+    if fold_dir.exists() and metrics_path.exists() and not overwrite:
+        print(f"  [SKIP] {model_name} / fold={fold} 已存在")
+        return try_load_metrics(fold_dir)
+
+    run_cfg = copy.deepcopy(cfg)
+    run_cfg["model"]["name"] = model_name
+    run_cfg.setdefault("train", {})
+    run_cfg["train"]["save_dir"] = str(save_root)
+    batch_size = run_cfg["train"]["batch_size"]
+
+    # 构建 Subset DataLoader
+    train_set = Subset(dataset, train_idx)
+    val_set = Subset(dataset, val_idx)
+    # 测试集：在 CV 中验证集即测试集
+    test_set = val_set
+
+    # collate_fn 选择
+    if isinstance(dataset, EmbeddingMultimodalDataset):
+        cfn = embedding_collate_fn
+    else:
+        cfn = collate_fn
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, collate_fn=cfn)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, collate_fn=cfn)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, collate_fn=cfn)
+
+    # dataset_info 推断
+    if isinstance(dataset, EmbeddingMultimodalDataset):
+        ref_items = dataset.items
+        tab_dim = ref_items[0]["tabular"].shape[0]
+        spec_len = ref_items[0]["spectra"].shape[0]
+    else:
+        tab_dim = dataset.items[0]["tabular"].shape[0]
+        spec_len = len(dataset.wave_cols)
+
+    labels_all = [dataset[i]["label"] for i in range(len(dataset))]
+    dataset_info = {
+        "tab_dim": tab_dim,
+        "spec_len": spec_len,
+        "num_classes": len(set(labels_all)),
+        "class_distribution": pd.Series(labels_all).value_counts().to_dict(),
+    }
+
+    print(f"  [TRAIN] {model_name} | fold={fold} | train={len(train_idx)} val={len(val_idx)}")
+    trainer = train_single_model(
+        run_cfg,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        dataset_info=dataset_info,
+        model_name=model_name,
+    )
+
+    # 将结果从 src_dir 复制到 fold_dir（仅复制 JSON/CSV/日志，跳过 .pt）
+    src_dir = save_root / model_name
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    if src_dir.exists():
+        import shutil
+        for f in list(src_dir.iterdir()):
+            if f.is_file() and f.suffix in (".json", ".csv", ".txt", ".log"):
+                dst = fold_dir / f.name
+                if dst.exists():
+                    dst.unlink()
+                shutil.copy2(str(f), str(dst))
+
+    metrics = try_load_metrics(fold_dir)
+    metrics["fold"] = fold
+    return metrics
+
+
+def aggregate_seeds(results: List[Dict[str, Any]], model_name: str) -> Dict[str, Any]:
+    """对同一模型的多种子结果计算 mean ± std。"""
+    numeric_keys = [
+        "test_auc", "test_acc", "test_f1",
+        "best_val_auc", "final_val_auc", "final_val_acc",
+        "n_parameters", "model_size_mb",
+    ]
+    row = {"model_name": model_name}
+    for key in numeric_keys:
+        vals = [r[key] for r in results if key in r and r[key] is not None]
+        if vals:
+            row[key] = np.mean(vals)
+            row[f"{key}_std"] = np.std(vals)
+        else:
+            row[key] = None
+            row[f"{key}_std"] = None
+    return row
+
+
+def run_experiments(args) -> pd.DataFrame:
+    cfg = load_config(args.config)
+    save_root = Path(cfg.get("experiment", {}).get("output_dir", "results"))
+    save_root.mkdir(parents=True, exist_ok=True)
+
+    # 统一启用 Lite
+    if args.lite:
+        cfg.setdefault("model", {})
+        cfg["model"].setdefault("lite", {})
+        cfg["model"]["lite"]["enabled"] = True
+        print(f"[INFO] 统一启用 Lite 模式: {cfg['model']['lite']}")
+
+    # 确定模型列表（强制包含基线）
+    model_names = args.models if args.models is not None else DEFAULT_MODELS
+    if args.baselines:
+        for baseline in ("ConcatFusion", "EnsembleFusion"):
+            if baseline not in model_names:
+                model_names = list(model_names) + [baseline]
+                print(f"[INFO] 强制补全基线模型: {baseline}")
+
+    summary_rows = []
+
+    if args.mode == "legacy":
+        # ========== 旧版行为：单种子、单折 ==========
         print("=" * 80)
-        
-        # 针对当前模型复制一份 config，并设置模型名称
-        this_cfg = copy.deepcopy(cfg)
-        this_cfg.setdefault("model", {})
-        this_cfg["model"]["name"] = model_name
-        
-        # 这里可以根据模型名做一些特别的超参数覆盖（可选）
-        # 例如：
-        # if model_name == "EnhancedMMTM":
-        #     this_cfg["model"]["fusion_strategy"] = "hierarchical"
-        
-        try:
-            # 训练当前模型
-            trainer = train_single_model(
-                this_cfg,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                test_loader=test_loader,
-                dataset_info=dataset_info,
-                model_name=model_name,
-            )
-            
-            # 模型结果目录：save_dir / model_name
-            model_dir = save_root / model_name
-            
-            # 尝试加载指标
-            results_data = try_load_metrics(model_dir)
-            
-            # 提取关键指标
-            if results_data:
-                if "metrics_summary.json" in str(model_dir / "metrics_summary.json"):
-                    # 如果已经有统一格式的 metrics_summary.json，直接使用
-                    metrics = results_data
-                else:
-                    # 否则从 results.json 中提取
-                    metrics = extract_metrics_from_results(results_data)
-            else:
-                metrics = {}
-            
-            row = {"model_name": model_name}
-            # 将 metrics 展平成一行（只展开简单标量）
-            if isinstance(metrics, dict):
-                for k, v in metrics.items():
-                    # 避免太乱，只收集简单标量
-                    if isinstance(v, (int, float, str, bool)) or v is None:
-                        row[k] = v
-            
+        print("[INFO] 运行模式: legacy（与旧版行为一致）")
+        print("=" * 80)
+        train_loader, val_loader, test_loader, dataset_info = prepare_data(cfg)
+        for idx, model_name in enumerate(model_names, 1):
+            print(f"\n[{idx}/{len(model_names)}] {model_name}")
+            this_cfg = copy.deepcopy(cfg)
+            this_cfg["model"]["name"] = model_name
+            try:
+                trainer = train_single_model(
+                    this_cfg, train_loader, val_loader, test_loader, dataset_info, model_name
+                )
+                metrics = try_load_metrics(save_root / model_name)
+                row = {"model_name": model_name, **metrics}
+                summary_rows.append(row)
+            except Exception as e:
+                print(f"[ERROR] {model_name} 失败: {e}")
+                import traceback
+                traceback.print_exc()
+                summary_rows.append({"model_name": model_name, "status": "failed", "error": str(e)})
+
+    elif args.mode == "single":
+        # ========== 多种子单折 ==========
+        print("=" * 80)
+        print(f"[INFO] 运行模式: single | seeds={args.seeds} | models={len(model_names)}")
+        print("=" * 80)
+        for model_name in model_names:
+            print(f"\n[INFO] 模型: {model_name}")
+            seed_results = []
+            for seed in args.seeds:
+                metrics = run_single_seed(cfg, model_name, seed, save_root, args.overwrite)
+                seed_results.append(metrics)
+            # 汇总
+            row = aggregate_seeds(seed_results, model_name)
             summary_rows.append(row)
-            print(f"[OK] {model_name} 训练完成并记录指标")
-            
-        except Exception as e:
-            print(f"[ERROR] {model_name} 训练失败: {e}")
-            import traceback
-            traceback.print_exc()
-            # 即使失败也记录一行，标记为失败
-            summary_rows.append({
-                "model_name": model_name,
-                "status": "failed",
-                "error": str(e)
-            })
-    
-    # 汇总为 DataFrame
-    df_summary = pd.DataFrame(summary_rows)
-    
-    # 保存 CSV
+
+    elif args.mode == "cv":
+        # ========== 交叉验证 ==========
+        print("=" * 80)
+        print(f"[INFO] 运行模式: cv | n_splits={args.n_splits}")
+        print("=" * 80)
+        set_seed(cfg.get("experiment", {}).get("random_seed", 42))
+
+        # 先准备一次数据以获取完整数据集
+        use_embedding = cfg.get("data", {}).get("use_embedding", False)
+        if use_embedding:
+            from multimodal.embedding_loader import (
+                load_spectrum_embedding, load_clinical_embedding, align_by_patient_id
+            )
+            spec_path = cfg["data"]["spectrum_embedding_path"]
+            clin_path = cfg["data"]["clinical_embedding_path"]
+            spectrum_dict = load_spectrum_embedding(spec_path)
+            clinical_dict = load_clinical_embedding(clin_path)
+            aligned = align_by_patient_id(spectrum_dict, clinical_dict)
+            dataset = EmbeddingMultimodalDataset(
+                aligned, split="all",
+                dropout_config={"spectra": 0.0, "clinical": 0.0}
+            )
+            labels = [item["label"] for item in dataset.items]
+        else:
+            import pandas as pd
+            spectra_csv = cfg["data"]["spectra_csv"]
+            clinical_csv = cfg["data"]["clinical_csv"]
+            spectra_df = pd.read_csv(spectra_csv, sep=None, engine="python")
+            wave_cols = [c for c in spectra_df.columns if c not in ["Sample", "Group"]]
+            preprocess_cfg = cfg.get("data", {}).get("preprocessing", None)
+            normalization_method = cfg.get("data", {}).get("preprocessing", {}).get("normalization", {}).get("method", "SNV")
+            scan_aggregation = cfg.get("data", {}).get("scan_aggregation", "sequence")
+            dataset = RamanDataset(
+                spectra_csv=spectra_csv,
+                clinical_csv=clinical_csv,
+                wave_cols=wave_cols,
+                label_col=cfg["data"].get("label_col", "Group"),
+                preprocess_fn=preprocess_spectrum,
+                preprocess_cfg=preprocess_cfg,
+                normalization_method=normalization_method,
+                scan_aggregation=scan_aggregation,
+                min_scans=1,
+                max_scans=cfg["data"].get("max_scans", 180),
+            )
+            labels = [item["label"] for item in dataset.items]
+
+        skf = StratifiedKFold(n_splits=args.n_splits, shuffle=True, random_state=cfg.get("experiment", {}).get("random_seed", 42))
+        splits = list(skf.split(range(len(dataset)), labels))
+
+        for model_name in model_names:
+            print(f"\n[INFO] 模型: {model_name}")
+            fold_results = []
+            for fold_idx, (train_idx, val_idx) in enumerate(splits, 1):
+                metrics = run_cv_fold(
+                    cfg, model_name, fold_idx, list(train_idx), list(val_idx),
+                    dataset, save_root, args.overwrite
+                )
+                fold_results.append(metrics)
+            row = aggregate_seeds(fold_results, model_name)
+            summary_rows.append(row)
+
+    else:
+        raise ValueError(f"未知运行模式: {args.mode}")
+
+    # 保存汇总表
+    df = pd.DataFrame(summary_rows)
     summary_path = save_root / "experiments_summary.csv"
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    df_summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
-    print(f"\n[OK] 实验汇总已保存到: {summary_path}")
-    
-    return df_summary
+    df.to_csv(summary_path, index=False, encoding="utf-8-sig")
+    print(f"\n[OK] 实验汇总已保存: {summary_path}")
+
+    # 自动调用结果聚合
+    try:
+        print("[INFO] 自动生成对比表格...")
+        cmd = [
+            sys.executable,
+            str(THIS_DIR / "generate_main_results_table.py"),
+            "--summary_path", str(summary_path),
+            "--config", args.config,
+        ]
+        subprocess.run(cmd, check=False)
+    except Exception as e:
+        print(f"[WARN] 自动结果聚合失败: {e}")
+
+    return df
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run multiple multimodal experiments and summarize results.",
+        description="Standardized multimodal experiment orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 使用默认模型列表，强制 embedding 模式
-  python scripts/run_multimodal_experiments.py --config configs/enhanced_config.yaml --embedding_only
-  
-  # 指定要跑的模型
-  python scripts/run_multimodal_experiments.py --config configs/enhanced_config.yaml --models AttentionMultimodal EnhancedMMTM
-  
-  # 使用自定义配置
-  python scripts/run_multimodal_experiments.py --config configs/my_config.yaml
-        """
+  # 多种子单折 + Lite
+  python scripts/run_multimodal_experiments.py \\
+      --config configs/experiment_base.yaml \\
+      --models SpectraOnlyModel ClinicalOnlyModel ConcatFusion \\
+      --mode single --seeds 0 1 2 --lite
+
+  # 5-Fold CV
+  python scripts/run_multimodal_experiments.py \\
+      --config configs/experiment_base.yaml \\
+      --models AttentionMultimodal \\
+      --mode cv --n_splits 5
+
+  # 旧版行为（默认）
+  python scripts/run_multimodal_experiments.py \\
+      --config configs/enhanced_config.yaml
+"""
     )
+    parser.add_argument("--config", type=str, default="configs/experiment_base.yaml")
+    parser.add_argument("--models", type=str, nargs="*", default=None)
     parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/enhanced_config.yaml",
-        help="Path to base YAML config (default: configs/enhanced_config.yaml)",
+        "--mode", type=str, default="legacy",
+        choices=["legacy", "single", "cv"],
+        help="运行模式: legacy=旧版单折, single=多种子单折, cv=交叉验证"
     )
-    parser.add_argument(
-        "--models",
-        type=str,
-        nargs="*",
-        default=None,
-        help="Model names to run (override default list). Example: --models AttentionMultimodal EnhancedMMTM",
-    )
-    parser.add_argument(
-        "--embedding_only",
-        action="store_true",
-        help="Force use_embedding=True for all experiments.",
-    )
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    parser.add_argument("--n_splits", type=int, default=5)
+    parser.add_argument("--lite", action="store_true", help="统一启用 model.lite.enabled=True")
+    parser.add_argument("--baselines", action="store_true", help="强制包含 ConcatFusion 和 EnsembleFusion")
+    parser.add_argument("--overwrite", action="store_true", help="覆盖已有结果")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    
-    # 确定要跑的模型列表
-    model_names = args.models if args.models is not None else DEFAULT_MODELS
-    
     print("=" * 80)
-    print("[INFO] 多模型循环训练脚本")
+    print("[INFO] 标准化消融实验运行器")
     print("=" * 80)
     print(f"[INFO] 配置文件: {args.config}")
-    print(f"[INFO] 将要运行的模型列表 ({len(model_names)} 个):")
-    for name in model_names:
-        print(f"  - {name}")
-    if args.embedding_only:
-        print("[INFO] 强制启用 embedding 模式")
+    print(f"[INFO] 运行模式: {args.mode}")
+    print(f"[INFO] 模型列表: {args.models if args.models else '默认列表'}")
+    if args.lite:
+        print("[INFO] Lite 模式: 启用")
     print("=" * 80)
-    
+
     try:
-        df = run_experiments(
-            config_path=args.config,
-            model_names=model_names,
-            use_embedding_only=args.embedding_only,
-        )
-        
+        df = run_experiments(args)
         print("\n" + "=" * 80)
-        print("[INFO] 汇总结果预览：")
+        print("汇总结果预览:")
         print("=" * 80)
         print(df.to_string(index=False))
         print("\n[OK] 所有实验完成！")
-        
     except KeyboardInterrupt:
-        print("\n[WARN] 用户中断训练")
+        print("\n[WARN] 用户中断")
         sys.exit(1)
     except Exception as e:
         print(f"\n[ERROR] 运行出错: {e}")
@@ -291,4 +465,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

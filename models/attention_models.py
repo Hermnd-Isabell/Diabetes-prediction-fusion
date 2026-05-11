@@ -287,8 +287,14 @@ class EnhancedCrossAttentionFusion(nn.Module):
     - 残差连接：保持梯度流动
     - 层归一化：提升训练稳定性
     """
-    def __init__(self, spec_dim, tab_dim, hid_dim=256, num_heads=8, dropout=0.1):
+    def __init__(self, spec_dim, tab_dim, hid_dim=256, num_heads=8, dropout=0.1, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            hid_dim = self.lite_cfg.get("cross_attn_dim", 64)
+            num_heads = self.lite_cfg.get("cross_attn_heads", 1)
+            dropout = self.lite_cfg.get("dropout", 0.3)
         self.hid_dim = hid_dim
         self.num_heads = num_heads
         
@@ -396,27 +402,32 @@ class EnhancedClassifier(nn.Module):
     - 层归一化：提升训练稳定性
     - 自适应dropout：根据训练阶段调整
     """
-    def __init__(self, in_dim, num_classes=2, hidden_dims=[512, 256, 128], dropout=0.2):
+    def __init__(self, in_dim, num_classes=2, hidden_dims=[512, 256, 128], dropout=0.2, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
+        if self.is_lite:
+            hidden_dims = self.lite_cfg.get("classifier_dims", [64, 32])
+            dropout = self.lite_cfg.get("dropout", 0.3)
         self.num_classes = num_classes
-        
+
         # 构建多层网络
         layers = []
         prev_dim = in_dim
-        
+
         for i, hidden_dim in enumerate(hidden_dims):
             # 线性层
             layers.append(nn.Linear(prev_dim, hidden_dim))
-            
+
             # 层归一化
             layers.append(nn.LayerNorm(hidden_dim))
-            
+
             # 激活函数
             layers.append(nn.ReLU(inplace=True))
-            
+
             # Dropout
             layers.append(nn.Dropout(dropout))
-            
+
             prev_dim = hidden_dim
         
         # 最终分类层
@@ -473,47 +484,60 @@ class EnhancedAttentionMultimodal(nn.Module):
     - 更深的分类器网络
     - 可配置的融合策略
     """
-    def __init__(self, spec_embedding_dim=256, tab_embedding_dim=128, num_classes=2, 
-                 fusion_type='enhanced_cross', use_auxiliary=True, hidden_dims=[512, 256, 128]):
+    def __init__(self, spec_embedding_dim=256, tab_embedding_dim=128, num_classes=2,
+                 fusion_type='enhanced_cross', use_auxiliary=True, hidden_dims=[512, 256, 128], num_heads=8, lite_cfg=None):
         super().__init__()
+        self.lite_cfg = lite_cfg or {}
+        self.is_lite = self.lite_cfg.get("enabled", False)
         self.spec_encoder = SpectraEncoder(emb_dim=spec_embedding_dim)
         self.tab_encoder = TabularEncoder(emb_dim=tab_embedding_dim)
         self.use_auxiliary = use_auxiliary
-        
+
+        if self.is_lite:
+            hidden_dims = self.lite_cfg.get("classifier_dims", [64, 32])
+            num_heads = self.lite_cfg.get("cross_attn_heads", 1)
+
         # 选择融合策略
         if fusion_type == 'enhanced_cross':
+            fusion_out_dim = self.lite_cfg.get("cross_attn_dim", 64) if self.is_lite else 256
             self.fusion = EnhancedCrossAttentionFusion(
-                spec_dim=spec_embedding_dim, 
-                tab_dim=tab_embedding_dim, 
-                hid_dim=256,
-                num_heads=8,
-                dropout=0.1
+                spec_dim=spec_embedding_dim,
+                tab_dim=tab_embedding_dim,
+                hid_dim=fusion_out_dim,
+                num_heads=num_heads,
+                dropout=0.1,
+                lite_cfg=lite_cfg
             )
-            self.classifier = EnhancedClassifier(256, num_classes=num_classes, hidden_dims=hidden_dims)
+            self.classifier = EnhancedClassifier(fusion_out_dim, num_classes=num_classes, hidden_dims=hidden_dims, lite_cfg=lite_cfg)
         elif fusion_type == 'concat':
             self.fusion = None
             self.classifier = EnhancedClassifier(
-                spec_embedding_dim + tab_embedding_dim, 
-                num_classes=num_classes, 
-                hidden_dims=hidden_dims
+                spec_embedding_dim + tab_embedding_dim,
+                num_classes=num_classes,
+                hidden_dims=hidden_dims,
+                lite_cfg=lite_cfg
             )
         else:
             raise ValueError(f"Unknown fusion type: {fusion_type}")
-        
+
         self.fusion_type = fusion_type
-        
+
         # 辅助监督分类器
         if self.use_auxiliary:
-            self.aux_spec_classifier = EnhancedClassifier(
-                spec_embedding_dim, 
-                num_classes=num_classes, 
-                hidden_dims=[128, 64]
-            )
-            self.aux_tab_classifier = EnhancedClassifier(
-                tab_embedding_dim, 
-                num_classes=num_classes, 
-                hidden_dims=[64, 32]
-            )
+            if self.is_lite:
+                self.aux_spec_classifier = nn.Linear(spec_embedding_dim, num_classes)
+                self.aux_tab_classifier = nn.Linear(tab_embedding_dim, num_classes)
+            else:
+                self.aux_spec_classifier = EnhancedClassifier(
+                    spec_embedding_dim,
+                    num_classes=num_classes,
+                    hidden_dims=[128, 64]
+                )
+                self.aux_tab_classifier = EnhancedClassifier(
+                    tab_embedding_dim,
+                    num_classes=num_classes,
+                    hidden_dims=[64, 32]
+                )
 
     def forward(self, spectra_result, tabular_result):
         """
@@ -586,14 +610,17 @@ class AttentionMultimodal(EnhancedAttentionMultimodal):
     1. model(spectra_result, tabular_result) - 原始方式，需要预计算的embedding/logits
     2. model(spectra, mask, tabular) - 新方式，直接从原始数据计算
     """
-    def __init__(self, spec_embedding_dim=256, tab_embedding_dim=128, num_classes=2, fusion_type='enhanced_cross', tab_dim=None):
+    def __init__(self, spec_embedding_dim=256, tab_embedding_dim=128, num_classes=2, fusion_type='enhanced_cross', tab_dim=None,
+                 hidden_dims=[512, 256, 128], num_heads=8, lite_cfg=None):
         super().__init__(
             spec_embedding_dim=spec_embedding_dim,
             tab_embedding_dim=tab_embedding_dim,
             num_classes=num_classes,
             fusion_type=fusion_type,
             use_auxiliary=True,
-            hidden_dims=[512, 256, 128]
+            hidden_dims=hidden_dims,
+            num_heads=num_heads,
+            lite_cfg=lite_cfg
         )
         
         # 保存属性（确保在调用_build方法之前设置）
@@ -607,31 +634,60 @@ class AttentionMultimodal(EnhancedAttentionMultimodal):
     
     def _build_spectral_encoder(self):
         """构建内部光谱编码器"""
-        return nn.Sequential(
-            # 扫描级特征提取
-            ResidualConv1D(1, 64, kernel_size=7),
-            ResidualConv1D(64, 128, kernel_size=5),
-            ResidualConv1D(128, 256, kernel_size=3),
-            nn.AdaptiveAvgPool1d(1),  # 全局平均池化
-            nn.Flatten(),
-            nn.Linear(256, self.spec_embedding_dim),
-            nn.LayerNorm(self.spec_embedding_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
+        if self.is_lite:
+            channels = self.lite_cfg.get("cnn_channels", [8, 16, 8])
+            dropout = self.lite_cfg.get("dropout", 0.3)
+            return nn.Sequential(
+                ResidualConv1D(1, channels[0], kernel_size=7),
+                ResidualConv1D(channels[0], channels[1], kernel_size=5),
+                ResidualConv1D(channels[1], channels[2], kernel_size=3),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(channels[2], self.spec_embedding_dim),
+                nn.LayerNorm(self.spec_embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+        else:
+            return nn.Sequential(
+                # 扫描级特征提取
+                ResidualConv1D(1, 64, kernel_size=7),
+                ResidualConv1D(64, 128, kernel_size=5),
+                ResidualConv1D(128, 256, kernel_size=3),
+                nn.AdaptiveAvgPool1d(1),  # 全局平均池化
+                nn.Flatten(),
+                nn.Linear(256, self.spec_embedding_dim),
+                nn.LayerNorm(self.spec_embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
     
     def _build_tabular_encoder(self, tab_dim):
         """构建内部表格编码器"""
-        return nn.Sequential(
-            nn.Linear(tab_dim, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, self.tab_embedding_dim),
-            nn.LayerNorm(self.tab_embedding_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
+        if self.is_lite:
+            h = self.lite_cfg.get("hidden_dim", 32)
+            dropout = self.lite_cfg.get("dropout", 0.3)
+            return nn.Sequential(
+                nn.Linear(tab_dim, h),
+                nn.LayerNorm(h),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(h, self.tab_embedding_dim),
+                nn.LayerNorm(self.tab_embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+        else:
+            return nn.Sequential(
+                nn.Linear(tab_dim, 256),
+                nn.LayerNorm(256),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(256, self.tab_embedding_dim),
+                nn.LayerNorm(self.tab_embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
     
     def forward(self, *args):
         """

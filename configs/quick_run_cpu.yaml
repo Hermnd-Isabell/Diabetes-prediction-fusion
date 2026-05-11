@@ -1,0 +1,19 @@
+# 临时快速实验配置 - CPU 环境 + Embedding 模式
+# 继承 experiment_base.yaml，仅覆盖必要参数
+
+defaults:
+  - experiment_base
+
+experiment:
+  name: "quick_run_cpu_embedding"
+  description: "CPU 快速验证实验 - Embedding 模式"
+  device: "cpu"
+
+data:
+  use_embedding: true
+  spectrum_embedding_path: spectrum_dimension/diabetes_results/Light_CNN_MLP_features.csv
+  clinical_embedding_path: data/clinical.csv
+
+device:
+  use_cuda: false
+  mixed_precision: false

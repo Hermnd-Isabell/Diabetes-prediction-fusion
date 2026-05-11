@@ -1,0 +1,217 @@
+# configs/experiment_base.yaml
+# 统一基础配置：所有模型共享的默认参数
+# 子配置文件通过 defaults 机制继承，仅需覆盖差异化参数
+
+experiment:
+  name: "diabetes_multimodal"
+  description: "多模态糖尿病预测实验"
+  tags:
+    - multimodal
+    - diabetes
+  random_seed: 42
+  device: "cuda"
+  output_dir: "results"
+
+data:
+  spectra_csv: data/spectra.csv
+  clinical_csv: data/clinical.csv
+  label_col: Group
+  max_scans: 180
+
+  # Embedding 模式配置
+  use_embedding: false
+  spectrum_embedding_path: spectrum_dimension/diabetes_results/Light_CNN_MLP_features.csv
+  clinical_embedding_path: data/clinical.csv
+
+  # 扫描序列聚合方式
+  scan_aggregation: "sequence"   # "sequence" | "stats"
+
+  # 数据划分（向后兼容：也支持 train_ratio/val_ratio/test_ratio）
+  train_val_test_ratio: [0.7, 0.15, 0.15]
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+  # 预处理配置
+  preprocessing:
+    baseline_correction:
+      enabled: true
+      method: "AsLS"
+      lam: 1000000.0
+      p: 0.001
+      niter: 10
+    smoothing:
+      enabled: true
+      window: 11
+      polyorder: 2
+    normalization:
+      method: "SNV"   # "SNV" | "patient_zscore"
+
+  # Embedding 生成审计
+  embedding:
+    generation_scope: null
+    generation_log: null
+
+  num_workers: 0
+
+model:
+  name: "AttentionMultimodal"
+  num_classes: 4
+  dropout: 0.1
+
+  # 轻量化配置（模型压缩）
+  lite:
+    enabled: false
+    hidden_dim: 32
+    dropout: 0.3
+    cnn_channels: [8, 16, 8]
+    cross_attn_dim: 64
+    cross_attn_heads: 1
+    classifier_dims: [64, 32]
+    d_model: 64
+    nhead: 2
+    num_layers: 1
+    fusion_dim: 64
+    bottleneck_dim: 32
+    num_attention_heads: 2
+    scales: ["global"]
+    enable_uncertainty: false
+
+  # 通用模型参数
+  spec_emb: 256
+  tab_emb: 128
+
+  # 注意力模型参数
+  fusion: cross
+  num_attention_heads: 8
+  hidden_dims: [256, 128]
+
+  # MMTM 模型参数
+  mmtm_bottleneck: 128
+  fusion_strategy: hierarchical
+  enable_uncertainty: true
+
+train:
+  epochs: 60
+  batch_size: 8
+  lr: 0.001
+  weight_decay: 1e-4
+  patience: 15
+  early_stopping_patience: 15
+  use_class_weights: false
+  use_augmentation: false
+  augmentation_params:
+    noise: 0.01
+    scale: 0.1
+
+  # 模态 Dropout（仅在 embedding 模式训练集生效）
+  modality_dropout:
+    spectra: 0.15
+    clinical: 0.10
+
+  save_dir: results
+  save_prefix: model
+
+  # 高级训练策略（全部可选；缺失或 enabled=false 时与修改前完全一致）
+  advanced:
+    enabled: false
+    loss_type: "CE"
+    focal_gamma: 2.0
+    label_smoothing: 0.0
+    aux_weight: 1.0
+    aux_decay_schedule: null
+    optimizer: "AdamW"
+    sam_rho: 0.05
+    scheduler_type: "plateau"
+    warmup_epochs: 0
+    cosine_T_max: 100
+    param_groups:
+      spectra_encoder:
+        lr_multiplier: 1.0
+        wd_multiplier: 1.0
+      clinical_encoder:
+        lr_multiplier: 1.0
+        wd_multiplier: 1.0
+      fusion_module:
+        lr_multiplier: 1.0
+        wd_multiplier: 1.0
+      classifier_head:
+        lr_multiplier: 1.0
+        wd_multiplier: 1.0
+    grad_clip_max_norm: null
+    early_stop_metric: "auc"
+    early_stop_patience: 15
+    phase_training:
+      enabled: false
+      phase1_epochs: 20
+      phase1_modules: ["spectra_encoder", "clinical_encoder"]
+      phase2_modules: ["fusion_module", "classifier_head"]
+
+evaluation:
+  metrics:
+    compute_macro_auc: true
+    compute_weighted_auc: true
+    compute_cohens_kappa: true
+    compute_qwk: true
+  cross_validation:
+    enabled: false
+    n_splits: 5
+    shuffle: true
+    random_state: 42
+    inner_val_ratio: 0.15
+  statistical_test:
+    enabled: false
+    alpha: 0.05
+    metric_for_comparison: "macro_auc"
+
+visualization:
+  enable: true
+  save_plots: true
+  plot_format: png
+  dpi: 300
+  plot_training_curves: true
+  plot_validation_curves: true
+  plot_roc_curves: true
+  plot_confusion_matrix: true
+  plot_precision_recall: true
+  plot_prediction_distribution: true
+  plot_feature_visualization: true
+
+interpretability:
+  enable: true
+  shap_analysis: true
+  shap_background_samples: 10
+  shap_explanation_samples: 5
+  attention_analysis: true
+  attention_visualization: true
+  feature_importance: true
+  pca_analysis: true
+  tsne_analysis: true
+  gradcam_analysis: false
+
+comparison:
+  enable: true
+  compare_metrics:
+    - acc
+    - auc
+    - f1
+    - sensitivity@90%spec
+  plot_comparison_charts: true
+  plot_roc_comparison: true
+  save_comparison_table: true
+
+logging:
+  level: INFO
+  save_logs: true
+  log_file: training.log
+
+device:
+  use_cuda: true
+  cuda_device: 0
+  mixed_precision: false
+
+# 要训练的模型列表（用于 --train-all 模式）
+models_to_train:
+  - AttentionMultimodal
+  - ConcatFusion
+  - TFTMultimodal

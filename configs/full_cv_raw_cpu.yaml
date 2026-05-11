@@ -1,0 +1,16 @@
+# 完整原始配置（Raw 模式 + CPU + 5-Fold CV）
+# 使用独立的 results_cv 目录，避免与单折实验写入冲突
+
+defaults:
+  - full_run_raw_cpu
+
+train:
+  save_dir: results_cv
+
+evaluation:
+  cross_validation:
+    enabled: true
+    n_splits: 5
+    shuffle: true
+    random_state: 42
+    inner_val_ratio: 0.15
